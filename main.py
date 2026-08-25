@@ -43,6 +43,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import http.client
+import ssl
 import uuid
 import zipfile
 from pathlib import Path
@@ -343,6 +345,12 @@ def panel_style():
 # Small secondary-colored text style for sidebar and form labels
 def sidebar_label_muted_style():
     return f"color: {TEXT_SECONDARY}; font-size: 11px;"
+
+
+# Grayed-out variant of sidebar_label_muted_style(), used for sidebar info lines
+# (speed/runtime/total size) while their value is zero
+def sidebar_label_inactive_style():
+    return f"color: {TEXT_FAINT}; font-size: 11px;"
 
 
 # Highlight style applied to a settings row that matches the live search
@@ -988,13 +996,67 @@ MEMBERS_ONLY_ERROR_HINT = "member"
 
 
 APP_NAME = "ytdlp-links"
-APP_VERSION = "2026.08.17"
+APP_VERSION = "2026.08.24"
 
 # API endpoint this app's own releases will be checked against, mirroring
 # _YTDLP_LATEST_RELEASE_URL/_FFMPEG_LATEST_RELEASE_URL below. Left unset for now -
 # the About tab's app-version check treats that the same as a failed lookup
 # ("could not check for updates") until this is filled in.
 APP_LATEST_RELEASE_URL = None
+
+
+# Build a urllib opener that routes through proxy, which is a "scheme://host:port"
+# string from Connection settings' proxy protocol dropdown (see _current_proxy), or
+# None/empty for a direct connection. Plain HTTP proxies use urllib's built-in
+# ProxyHandler; urllib has no native SOCKS support, so a "socks5://" proxy is routed
+# through PySocks instead (the same optional dependency yt-dlp itself relies on for
+# --proxy socks5://... , so it's already expected to be present wherever proxy
+# support matters). Raises urllib.error.URLError - caught the same way every caller
+# already handles connection failures - if PySocks isn't installed or the scheme
+# isn't recognized, so callers don't need any extra exception handling.
+def _build_proxy_opener(proxy):
+    if not proxy:
+        return urllib.request.build_opener()
+    parsed = urllib.parse.urlsplit(proxy)
+    scheme = (parsed.scheme or "http").lower()
+    if scheme in ("http", "https"):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    if scheme != "socks5":
+        raise urllib.error.URLError(f"Unsupported proxy scheme: {scheme!r}")
+    try:
+        import socks  # PySocks
+    except ImportError as exc:
+        raise urllib.error.URLError(
+            "SOCKS5 proxy support requires the 'PySocks' package (pip install PySocks)"
+        ) from exc
+
+    socks_host, socks_port = parsed.hostname, parsed.port
+
+    class _Socks5HTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = socks.socksocket()
+            self.sock.set_proxy(socks.SOCKS5, socks_host, socks_port)
+            self.sock.settimeout(self.timeout)
+            self.sock.connect((self.host, self.port))
+
+    class _Socks5HTTPSConnection(http.client.HTTPSConnection):
+        def connect(self):
+            raw_sock = socks.socksocket()
+            raw_sock.set_proxy(socks.SOCKS5, socks_host, socks_port)
+            raw_sock.settimeout(self.timeout)
+            raw_sock.connect((self.host, self.port))
+            context = self._context or ssl.create_default_context()
+            self.sock = context.wrap_socket(raw_sock, server_hostname=self.host)
+
+    class _Socks5HTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(_Socks5HTTPConnection, req)
+
+    class _Socks5HTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(_Socks5HTTPSConnection, req)
+
+    return urllib.request.build_opener(_Socks5HTTPHandler(), _Socks5HTTPSHandler())
 
 
 # Ask wherever this app's releases end up published (see APP_LATEST_RELEASE_URL)
@@ -1004,12 +1066,11 @@ APP_LATEST_RELEASE_URL = None
 def get_latest_app_version(timeout=8, proxy=None):
     if not APP_LATEST_RELEASE_URL:
         return None
-    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
-    opener = urllib.request.build_opener(*handlers)
     request = urllib.request.Request(
         APP_LATEST_RELEASE_URL, headers={"Accept": "application/vnd.github+json"},
     )
     try:
+        opener = _build_proxy_opener(proxy)
         with opener.open(request, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
@@ -1659,8 +1720,7 @@ def _existing_thumbnail_path(link_uuid):
 def _download_to_file(url, dest_path, timeout, proxy=None):
     if urllib.parse.urlparse(url).scheme not in ("http", "https"):
         raise ValueError(f"refusing to download non-http(s) url: {url!r}")
-    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
-    opener = urllib.request.build_opener(*handlers)
+    opener = _build_proxy_opener(proxy)
     with opener.open(url, timeout=timeout) as resp:
         dest_path.write_bytes(resp.read())
 
@@ -1876,12 +1936,11 @@ _YTDLP_NIGHTLY_RELEASES_PAGE_URL = "https://github.com/yt-dlp/yt-dlp-nightly-bui
 # HTTP, or parsing failure - the About tab treats that as "couldn't check", not
 # as "no update available".
 def get_latest_ytdlp_version(timeout=8, proxy=None):
-    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
-    opener = urllib.request.build_opener(*handlers)
     request = urllib.request.Request(
         _YTDLP_LATEST_RELEASE_URL, headers={"Accept": "application/vnd.github+json"},
     )
     try:
+        opener = _build_proxy_opener(proxy)
         with opener.open(request, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
@@ -2000,12 +2059,11 @@ def _ffmpeg_version_display(version):
 # that as "couldn't check", not as "no update available", same contract as
 # get_latest_ytdlp_version.
 def get_latest_ffmpeg_version(timeout=8, proxy=None):
-    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
-    opener = urllib.request.build_opener(*handlers)
     request = urllib.request.Request(
         _FFMPEG_LATEST_RELEASE_URL, headers={"Accept": "application/vnd.github+json"},
     )
     try:
+        opener = _build_proxy_opener(proxy)
         with opener.open(request, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
@@ -2198,8 +2256,6 @@ def _download_ytdlp_fresh(timeout=180, log=None, proxy=None):
         log = lambda _msg: None
 
     asset_name = _ytdlp_bin_name()
-    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
-    opener = urllib.request.build_opener(*handlers)
     # GitHub's API (and, on some networks, intermediate proxies) will reject or
     # mangle requests with no User-Agent at all, so always send one.
     common_headers = {"User-Agent": "Mozilla/5.0 (compatible; ytdlp-updater)"}
@@ -2210,6 +2266,7 @@ def _download_ytdlp_fresh(timeout=180, log=None, proxy=None):
         headers={**common_headers, "Accept": "application/vnd.github+json"},
     )
     try:
+        opener = _build_proxy_opener(proxy)
         with opener.open(request, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as e:
@@ -2269,8 +2326,6 @@ def update_ffmpeg(timeout=180, log=None, proxy=None):
         log = lambda _msg: None
 
     asset_name = _ffmpeg_release_asset_name()
-    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
-    opener = urllib.request.build_opener(*handlers)
     # GitHub's API (and, on some networks, intermediate proxies) will reject or
     # mangle requests with no User-Agent at all, so always send one.
     common_headers = {"User-Agent": "Mozilla/5.0 (compatible; ffmpeg-updater)"}
@@ -2281,6 +2336,7 @@ def update_ffmpeg(timeout=180, log=None, proxy=None):
         headers={**common_headers, "Accept": "application/vnd.github+json"},
     )
     try:
+        opener = _build_proxy_opener(proxy)
         with opener.open(request, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as e:
@@ -3280,6 +3336,396 @@ class SettingsSearchLineEdit(QLineEdit):
         self.focusLost.emit()
 
 
+# Sidebar label showing the active profile ("Profile: <name>"). On hover it
+# appends a "click to change" hint (without baking that hint into the real
+# text - see setText), and clicking it emits `clicked` so MainWindow can pop
+# up the quick profile-switch dialog (see _show_profile_switch_popup).
+class ProfileLabel(QLabel):
+    clicked = Signal()
+
+    # How long the "click to change" hint lingers after the mouse leaves,
+    # before reverting to the plain "Profile: <n>" text - gives a moving
+    # mouse a moment to come back without the hint flickering off.
+    _HOVER_REVERT_DELAY_MS = 100
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._base_text = self.text()
+        self.setCursor(Qt.PointingHandCursor)
+        # True while the profile-switch popup this label opened is showing -
+        # keeps the hint up regardless of mouse position/timer (see
+        # set_popup_open, called from MainWindow._show_profile_switch_popup).
+        self._popup_open = False
+        self._revert_timer = QTimer(self)
+        self._revert_timer.setSingleShot(True)
+        self._revert_timer.setInterval(self._HOVER_REVERT_DELAY_MS)
+        self._revert_timer.timeout.connect(self._revert_text)
+
+    # Keep the real ("base") text separate from what's displayed, so callers
+    # updating this label (e.g. _update_profile_label) never need to know
+    # about the hover hint, and leaving/re-entering doesn't lose it.
+    def setText(self, text):
+        self._base_text = text
+        show_hint = self.underMouse() or self._popup_open
+        super().setText(f"{text} \u2014 click to change" if show_hint else text)
+
+    # Called by MainWindow when the profile-switch popup opens/closes. While
+    # open, the hint stays regardless of hover/timer state; on close, revert
+    # immediately unless the mouse is still over the label (hover rules apply
+    # again from there).
+    def set_popup_open(self, open_):
+        self._popup_open = open_
+        if open_:
+            self._revert_timer.stop()
+            super().setText(f"{self._base_text} \u2014 click to change")
+        elif not self.underMouse():
+            self._revert_text()
+
+    def enterEvent(self, event):
+        super().enterEvent(event)
+        self._revert_timer.stop()
+        super().setText(f"{self._base_text} \u2014 click to change")
+
+    # Don't revert right away - start a short delay instead, so a mouse that
+    # merely passes over the label and back doesn't cause a flicker. Skipped
+    # entirely while the popup is open (see set_popup_open).
+    def leaveEvent(self, event):
+        super().leaveEvent(event)
+        if self._popup_open:
+            return
+        self._revert_timer.start()
+
+    def _revert_text(self):
+        super().setText(self._base_text)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+# Single row in the profile-switch popup's menu (see
+# MainWindow._show_profile_switch_popup) - styled like a dropdown/context-menu
+# item: transparent at rest, BG_BUTTON_HOVER on hover, and the current
+# profile's row gets a permanent BG_BUTTON fill plus a checkmark on the
+# right (no checkbox/radio indicator). Clicking a row emits `clicked`;
+# MainWindow decides whether that means switching profiles.
+class _ProfileMenuRow(QWidget):
+    clicked = Signal()
+
+    def __init__(self, text, selected=False, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setCursor(Qt.PointingHandCursor)
+        self._selected = selected
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 7, 12, 7)
+        layout.setSpacing(8)
+
+        self.text_label = QLabel(text)
+        self.text_label.setStyleSheet(
+            f"color: {TEXT_PRIMARY if selected else TEXT_SECONDARY}; "
+            f"font-size: 12px; background: transparent;"
+        )
+        layout.addWidget(self.text_label, stretch=1)
+
+        self.check_label = QLabel("\u2713" if selected else "")
+        self.check_label.setStyleSheet(
+            f"color: {BORDER_FOCUS}; font-size: 12px; background: transparent;"
+        )
+        layout.addWidget(self.check_label)
+
+        self._apply_style()
+
+    def _apply_style(self):
+        bg = BG_BUTTON if self._selected else "transparent"
+        self.setStyleSheet(
+            f"_ProfileMenuRow {{ background-color: {bg}; border-radius: 4px; }} "
+            f"_ProfileMenuRow:hover {{ background-color: {BG_BUTTON_HOVER}; }}"
+        )
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+# Single-window "New Profile" dialog: name + type up top, with a stacked area
+# below that swaps in whatever extra options that type needs (nothing for
+# Generic video/file/Playlist, a channel link for Channel, a dynamic list of
+# channel name+link rows for Sub Group) as soon as the type combo is changed -
+# replaces what used to be a chain of separate QInputDialog popups (name, then
+# type, then - for Channel/Sub Group - one or more further popups).
+class _NewProfileDialog(QDialog):
+    def __init__(self, parent, existing_names, default_quality):
+        super().__init__(parent)
+        self.setWindowTitle("New Profile")
+        self.setMinimumWidth(460)
+        self._existing_names = {n.lower() for n in existing_names}
+        self._default_quality = default_quality
+        self._subgroup_rows = []  # each: {"widget", "name_edit", "url_edit"}
+        self.result_data = None  # filled in on successful accept
+
+        # Extend the tab bar's panel background across the whole dialog,
+        # rather than just the strip behind the tabs.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(f"QDialog {{ background-color: {BG_PANEL}; }}")
+
+        layout = QVBoxLayout(self)
+
+        # Profile type as an underline tab bar (same look/pattern as the
+        # General/Connection/Profiles/... settings tab bar), sitting at the
+        # very top of the dialog. The name field goes underneath it.
+        self.type_tab_bar = self._build_type_tab_bar()
+        layout.addWidget(self.type_tab_bar)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit()
+        self.name_edit.setStyleSheet(settings_input_style())
+        form.addRow("Profile name:", self.name_edit)
+        layout.addLayout(form)
+
+        # Stacked area holding each type's extra options - only one widget per
+        # distinct set of options; the three types with nothing extra to ask
+        # (Generic video/file, Playlist) all share the same empty page.
+        self.options_stack = QStackedWidget()
+        self._page_empty = self._build_empty_page()
+        self._page_channel = self._build_channel_page()
+        self._page_subgroup = self._build_subgroup_page()
+        self.options_stack.addWidget(self._page_empty)
+        self.options_stack.addWidget(self._page_channel)
+        self.options_stack.addWidget(self._page_subgroup)
+        layout.addWidget(self.options_stack)
+
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setStyleSheet(f"color: {MEMBERS_ONLY_COLOR}; font-size: 12px;")
+        layout.addWidget(self.error_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._on_type_changed(PROFILE_TYPES[0])
+        self.name_edit.setFocus()
+
+    # Underline tab bar for picking the profile type - one UnderlineButton per
+    # entry in PROFILE_TYPES, exclusive/checkable via a QButtonGroup, same
+    # pattern as the main settings tab bar (see _build_settings_tab_bar).
+    def _build_type_tab_bar(self):
+        bar = QWidget()
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(10, 10, 10, 10)
+        bar_layout.setSpacing(6)
+
+        self._type_tab_index_to_name = {}
+        self.type_tab_group = QButtonGroup(bar)
+        self.type_tab_group.setExclusive(True)
+        bar_layout.addStretch(1)
+        for index, ptype in enumerate(PROFILE_TYPES):
+            btn = UnderlineButton(ptype, TEXT_SECONDARY, BORDER_FOCUS)
+            btn.setCheckable(True)
+            self.type_tab_group.addButton(btn, index)
+            bar_layout.addWidget(btn)
+            self._type_tab_index_to_name[index] = ptype
+        bar_layout.addStretch(1)
+
+        self.type_tab_group.button(0).setChecked(True)
+        self.type_tab_group.idClicked.connect(self._on_type_tab_clicked)
+        return bar
+
+    def _on_type_tab_clicked(self, index):
+        self._on_type_changed(self._type_tab_index_to_name.get(index, PROFILE_TYPES[0]))
+
+    # Currently-selected profile type, read from whichever tab is checked
+    def _current_type(self):
+        return self._type_tab_index_to_name.get(
+            self.type_tab_group.checkedId(), PROFILE_TYPES[0]
+        )
+
+    def _build_empty_page(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 4, 0, 0)
+        note = QLabel("No additional options for this profile type.")
+        note.setStyleSheet(sidebar_label_muted_style())
+        v.addWidget(note)
+        v.addStretch()
+        return page
+
+    def _build_channel_page(self):
+        page = QWidget()
+        v = QFormLayout(page)
+        v.setContentsMargins(0, 4, 0, 0)
+        self.channel_url_edit = QLineEdit()
+        self.channel_url_edit.setPlaceholderText(
+            "https://www.youtube.com/@name/videos or @name/shorts"
+        )
+        self.channel_url_edit.setStyleSheet(settings_input_style())
+        v.addRow("Channel link:", self.channel_url_edit)
+        return page
+
+    # Minimal borderless layout: no per-row box, just a hairline separator
+    # above each channel row and a plain inline "+ Add channel" link below.
+    def _build_subgroup_page(self):
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(0, 4, 0, 0)
+
+        label = QLabel("Channels in this sub group:")
+        label.setStyleSheet(sidebar_label_muted_style())
+        v.addWidget(label)
+
+        self.subgroup_rows_container = QWidget()
+        self.subgroup_rows_layout = QVBoxLayout(self.subgroup_rows_container)
+        self.subgroup_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.subgroup_rows_layout.setSpacing(1)
+        # Trailing stretch keeps rows pinned to the top of the scroll area
+        # instead of the container centering them when there's spare height -
+        # new rows are always inserted just before this stretch (see
+        # _add_subgroup_row) so it stays the last item.
+        self.subgroup_rows_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setWidget(self.subgroup_rows_container)
+        scroll.setMaximumHeight(220)
+        # Always reserve the scrollbar's width, even while everything fits -
+        # so adding rows never squeezes the existing rows narrower once a
+        # scrollbar appears; it just shows up already, grayed out, until
+        # there's enough content to actually scroll.
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        v.addWidget(scroll)
+
+        add_label = QLabel(
+            f'<a href="add" style="color: {BORDER_FOCUS}; text-decoration: none;">'
+            f"+ Add channel</a>"
+        )
+        add_label.setStyleSheet("font-size: 13px; padding-top: 8px;")
+        add_label.setOpenExternalLinks(False)
+        add_label.setCursor(Qt.PointingHandCursor)
+        add_label.linkActivated.connect(lambda _: self._add_subgroup_row())
+        v.addWidget(add_label)
+
+        self._add_subgroup_row()
+        return page
+
+    # Adds one new blank "channel name" + "channel link" row (with its own
+    # remove icon) to the Sub Group page - lets any number of channels be
+    # entered inline, in the same window, instead of one popup per channel.
+    def _add_subgroup_row(self):
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 3, 0, 3)
+        row_layout.setSpacing(6)
+
+        name_edit = QLineEdit()
+        name_edit.setPlaceholderText("Channel name")
+        name_edit.setStyleSheet(settings_input_style())
+        url_edit = QLineEdit()
+        url_edit.setPlaceholderText("https://www.youtube.com/@name/videos")
+        url_edit.setStyleSheet(settings_input_style())
+        remove_btn = QPushButton("\u2715")
+        remove_btn.setFixedWidth(20)
+        remove_btn.setCursor(Qt.PointingHandCursor)
+        remove_btn.setStyleSheet(
+            f"QPushButton {{ background-color: transparent; color: {TEXT_FAINT}; "
+            f"border: none; font-size: 13px; }} "
+            f"QPushButton:hover {{ color: {TEXT_SECONDARY}; }}"
+        )
+
+        row_layout.addWidget(name_edit, 1)
+        row_layout.addWidget(url_edit, 2)
+        row_layout.addWidget(remove_btn)
+        # Insert just before the trailing stretch (always the last item) so
+        # rows stay stacked at the top instead of growing past the stretch.
+        self.subgroup_rows_layout.insertWidget(
+            self.subgroup_rows_layout.count() - 1, row_widget
+        )
+
+        entry = {"widget": row_widget, "name_edit": name_edit, "url_edit": url_edit}
+        self._subgroup_rows.append(entry)
+        remove_btn.clicked.connect(lambda: self._remove_subgroup_row(entry))
+
+    def _remove_subgroup_row(self, entry):
+        # Always leave at least one row so there's somewhere to type into
+        if len(self._subgroup_rows) <= 1:
+            return
+        self._subgroup_rows.remove(entry)
+        entry["widget"].setParent(None)
+        entry["widget"].deleteLater()
+
+    # Swap the options page to match whichever type is currently selected
+    def _on_type_changed(self, ptype):
+        self.error_label.setText("")
+        if ptype == "Channel":
+            self.options_stack.setCurrentWidget(self._page_channel)
+        elif ptype == "Sub Group":
+            self.options_stack.setCurrentWidget(self._page_subgroup)
+        else:
+            self.options_stack.setCurrentWidget(self._page_empty)
+
+    def _set_error(self, message):
+        self.error_label.setText(message)
+
+    # Validates every field for whichever type is currently selected and, if
+    # everything checks out, stores the collected data in self.result_data and
+    # closes the dialog with Accepted.
+    def _on_accept(self):
+        name = _sanitize_profile_name(self.name_edit.text().strip())
+        if not name:
+            self._set_error("Enter a valid profile name")
+            return
+        if name.lower() in self._existing_names:
+            self._set_error(f"'{name}' already exists")
+            return
+
+        ptype = self._current_type()
+        channel_url = None
+        channels = None
+
+        if ptype == "Channel":
+            channel_url = self.channel_url_edit.text().strip()
+            if not _is_channel_videos_url(channel_url):
+                self._set_error(
+                    "Channel link must be a channel's \"/videos\" or \"/shorts\" page, "
+                    "e.g. https://www.youtube.com/@name/videos"
+                )
+                return
+        elif ptype == "Sub Group":
+            channels = []
+            seen = set()
+            for entry in self._subgroup_rows:
+                cname = entry["name_edit"].text().strip()
+                curl = entry["url_edit"].text().strip()
+                if not cname and not curl:
+                    continue  # skip a still-blank row
+                if not cname:
+                    self._set_error("Enter a name for every channel row")
+                    return
+                if cname in seen:
+                    self._set_error(f"'{cname}' was already added")
+                    return
+                if not _is_channel_videos_url(curl):
+                    self._set_error(
+                        f"'{cname}' needs a valid channel \"/videos\" or \"/shorts\" link"
+                    )
+                    return
+                seen.add(cname)
+                channels.append({"name": cname, "url": curl, "quality": self._default_quality})
+            if not channels:
+                self._set_error("Add at least one channel")
+                return
+
+        self.result_data = {
+            "name": name, "type": ptype, "channel_url": channel_url, "channels": channels,
+        }
+        self.accept()
+
+
 # Top-level application window: builds the UI and wires up all placeholder behavior
 class MainWindow(QMainWindow):
 
@@ -3588,6 +4034,8 @@ class MainWindow(QMainWindow):
              lambda w: w.text(), lambda w, v: w.setText(v)),
             ("proxy_enabled", self.chk_proxy,
              lambda w: w.isChecked(), lambda w, v: w.setChecked(v)),
+            ("proxy_protocol", self.proxy_protocol_combo,
+             lambda w: w.currentText(), lambda w, v: w.setCurrentText(v)),
             ("proxy_host", self.proxy_host_edit,
              lambda w: w.text(), lambda w, v: w.setText(v)),
             ("proxy_port", self.proxy_port_spin,
@@ -3834,6 +4282,12 @@ class MainWindow(QMainWindow):
         form.setSpacing(10)
         form.setLabelAlignment(Qt.AlignLeft)
 
+        self.proxy_protocol_combo = QComboBox()
+        self.proxy_protocol_combo.addItems(["HTTP", "SOCKS5"])
+        self.proxy_protocol_combo.setStyleSheet(settings_input_style())
+        self._settings_search_index.append({"text": "Proxy protocol", "tab_index": 1, "widget": self.proxy_protocol_combo})
+        form.addRow(self._settings_label("Proxy protocol", 1), self.proxy_protocol_combo)
+
         self.proxy_host_edit = QLineEdit()
         self.proxy_host_edit.setPlaceholderText("127.0.0.1")
         self.proxy_host_edit.setStyleSheet(settings_input_style())
@@ -3854,6 +4308,7 @@ class MainWindow(QMainWindow):
         self.proxy_port_spin.setButtonSymbols(QSpinBox.NoButtons)
         form.addRow(self._settings_label("Proxy port", 1), self.proxy_port_spin)
 
+        self.proxy_protocol_combo.setEnabled(False)
         self.proxy_host_edit.setEnabled(False)
         self.proxy_port_spin.setEnabled(False)
 
@@ -3959,11 +4414,13 @@ class MainWindow(QMainWindow):
 
         self.btn_new_profile = QPushButton("New...")
         self.btn_new_profile.setStyleSheet(button_style())
+        self.btn_new_profile.setMinimumWidth(80)
         self.btn_new_profile.clicked.connect(self._on_new_profile_clicked)
         profile_layout.addWidget(self.btn_new_profile)
 
         self.btn_delete_profile = QPushButton("Delete")
         self.btn_delete_profile.setStyleSheet(button_style())
+        self.btn_delete_profile.setMinimumWidth(80)
         self.btn_delete_profile.clicked.connect(self._on_delete_profile_clicked)
         profile_layout.addWidget(self.btn_delete_profile)
 
@@ -4170,8 +4627,12 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(about_donate_separator)
 
+        self.about_donate_title_label = QLabel("Support")
+        self.about_donate_title_label.setStyleSheet(sidebar_label_muted_style())
+        layout.addWidget(self.about_donate_title_label)
+
         self.about_donate_label = QLabel(
-            "ytdlp-links is provided absolutely free of charge with source code "
+            "ytdlp-links is provided free of charge with source code "
             "available under GPLv3 licence on github. If this program has been "
             "useful to you in any way consider donating using one of the methods "
             "below:"
@@ -4714,6 +5175,7 @@ class MainWindow(QMainWindow):
         ("Bitcoin", "bc1q8vwyhuxjwnlnp65n8n6x47gsud5mngar6a3avx"),
         ("ETH", "0x412eeD82a0F251a81eB69Dff951f0659Db9A5081"),
         ("USDT (ERC20)", "0x412eeD82a0F251a81eB69Dff951f0659Db9A5081"),
+        ("TON", "UQCJwlD9rS4CLX9tyBUpS9ZSRF2x_iBWh5B7Zx9HogrUnVzr"),
     )
 
     # Build the single settings sidebar panel shared by every settings tab (title,
@@ -4813,8 +5275,9 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(self.name_label)
 
-        self.profile_label = QLabel(f"Profile: {self._current_profile_name}")
+        self.profile_label = ProfileLabel(f"Profile: {self._current_profile_name}")
         self.profile_label.setStyleSheet(sidebar_label_muted_style())
+        self.profile_label.clicked.connect(lambda: self._show_profile_switch_popup(self.profile_label))
         layout.addWidget(self.profile_label)
 
         self.status_label = QLabel("status: ready")
@@ -4837,17 +5300,17 @@ class MainWindow(QMainWindow):
         # current by _update_sidebar_info()
         self.info_label_3 = QLabel("Runtime: 0:00")
         self.info_label_3.setAlignment(Qt.AlignCenter)
-        self.info_label_3.setStyleSheet(sidebar_label_muted_style())
+        self.info_label_3.setStyleSheet(sidebar_label_inactive_style())
         layout.addWidget(self.info_label_3)
 
         self.info_label_1 = QLabel("Total size: 0mb")
         self.info_label_1.setAlignment(Qt.AlignCenter)
-        self.info_label_1.setStyleSheet(sidebar_label_muted_style())
+        self.info_label_1.setStyleSheet(sidebar_label_inactive_style())
         layout.addWidget(self.info_label_1)
 
         self.info_label_2 = QLabel("Speed: 0.0 KB/s")
         self.info_label_2.setAlignment(Qt.AlignCenter)
-        self.info_label_2.setStyleSheet(sidebar_label_muted_style())
+        self.info_label_2.setStyleSheet(sidebar_label_inactive_style())
         layout.addWidget(self.info_label_2)
 
         self.sidebar_scroll.setWidget(self.sidebar_panel)
@@ -4992,9 +5455,11 @@ class MainWindow(QMainWindow):
         self.btn_exit.clicked.connect(self.close)
         self.url_line_edit.returnPressed.connect(self._on_url_entered)
         self.chk_proxy.stateChanged.connect(self._update_session_status_label)
+        self.proxy_protocol_combo.currentTextChanged.connect(self._update_session_status_label)
         self.proxy_host_edit.textChanged.connect(self._update_session_status_label)
         self.proxy_port_spin.valueChanged.connect(self._update_session_status_label)
         self.chk_proxy.stateChanged.connect(self._update_settings_sidebar_info)
+        self.proxy_protocol_combo.currentTextChanged.connect(self._update_settings_sidebar_info)
         self.proxy_host_edit.textChanged.connect(self._update_settings_sidebar_info)
         self.proxy_port_spin.valueChanged.connect(self._update_settings_sidebar_info)
         self.quality_combo.currentTextChanged.connect(self._update_settings_sidebar_info)
@@ -5106,9 +5571,9 @@ class MainWindow(QMainWindow):
             widget.blockSignals(True)
             setter(widget, snapshot[key])
             widget.blockSignals(False)
+        self.proxy_protocol_combo.setEnabled(self.chk_proxy.isChecked())
         self.proxy_host_edit.setEnabled(self.chk_proxy.isChecked())
         self.proxy_port_spin.setEnabled(self.chk_proxy.isChecked())
-        self.scheduler_start_time_edit.setEnabled(self.chk_scheduler_start.isChecked())
         self.scheduler_stop_time_edit.setEnabled(self.chk_scheduler_stop.isChecked())
         self._update_status_label()
         self._update_session_status_label()
@@ -6075,9 +6540,8 @@ class MainWindow(QMainWindow):
         if not self.proxy_host_edit.hasAcceptableInput():
             self._log(f"Proxy host '{host}' is not a valid IP address, ignoring proxy")
             return None
-        if "://" not in host:
-            host = f"http://{host}"
-        return f"{host}:{self.proxy_port_spin.value()}"
+        scheme = "socks5" if self.proxy_protocol_combo.currentText() == "SOCKS5" else "http"
+        return f"{scheme}://{host}:{self.proxy_port_spin.value()}"
 
     # Rewrite a probed item's text to "<quality> <size> - <title>" once yt-dlp returns
     def _on_probe_finished(self, item, info):
@@ -6197,6 +6661,86 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_NAME} - {self._current_profile_name}")
         self._update_settings_sidebar_info()
 
+    # Quick profile-switch popup, opened by clicking the sidebar's profile
+    # label (see ProfileLabel). Offers the same profiles as the Profiles
+    # settings tab's profile_list, as a flat dropdown/menu-style list
+    # (_ProfileMenuRow): each row is "type - name" ("default" for the Default
+    # profile), transparent at rest with a hover highlight; the current
+    # profile's row has a permanent background fill and a checkmark instead
+    # of a checkbox. Clicking a different row switches immediately (via
+    # _switch_profile) and closes the window; clicking the already-current
+    # row does nothing. Same order as profile_list (see _profile_sort_key):
+    # Default first, then Generic video / Generic file / Playlist / Channel /
+    # Sub Group. The list scrolls if it's taller than the popup. Opens as a
+    # normal (non-modal) window, centered over the main window. Minimum width
+    # is half the whole program's minimum width (see
+    # MainWindow.setMinimumSize(1000, 600)); height stays a fixed 200px.
+    def _show_profile_switch_popup(self, anchor):
+        anchor.set_popup_open(True)
+
+        popup = QDialog(self)
+        popup.finished.connect(lambda _result: anchor.set_popup_open(False))
+        popup.setWindowTitle("Switch profile")
+        popup.setMinimumSize(self.minimumWidth() // 2, 200)
+        popup.setStyleSheet(panel_style())
+        popup.setAttribute(Qt.WA_StyledBackground, True)
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setStyleSheet(f"background-color: {BG_PANEL}; border: none;")
+
+        list_content = QWidget()
+        list_content.setStyleSheet("background: transparent;")
+        list_layout = QVBoxLayout(list_content)
+        list_layout.setContentsMargins(0, 0, 4, 0)
+        list_layout.setSpacing(2)
+
+        def on_row_clicked(name):
+            if name != self._current_profile_name:
+                popup.close()
+                self._switch_profile(name)
+
+        for profile in sorted(self._profiles, key=self._profile_sort_key):
+            name = profile["name"]
+            if name == DEFAULT_PROFILE_NAME:
+                label = "default"
+            else:
+                ptype = profile.get("type")
+                label = f"{ptype.lower()} - {name}" if ptype else name
+
+            row = _ProfileMenuRow(label, selected=(name == self._current_profile_name))
+            row.clicked.connect(lambda n=name: on_row_clicked(n))
+            list_layout.addWidget(row)
+
+        list_layout.addStretch()
+        scroll.setWidget(list_content)
+        layout.addWidget(scroll, stretch=1)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        btn_close = QPushButton("Close")
+        btn_close.setStyleSheet(button_style())
+        btn_close.setMinimumWidth(80)
+        btn_close.clicked.connect(popup.close)
+        close_row.addWidget(btn_close)
+        layout.addLayout(close_row)
+
+        # Center over the main window rather than wherever the label was clicked.
+        parent_geo = self.geometry()
+        popup.resize(
+            max(popup.sizeHint().width(), self.minimumWidth() // 2),
+            max(popup.sizeHint().height(), 200),
+        )
+        x = parent_geo.center().x() - popup.width() // 2
+        y = parent_geo.center().y() - popup.height() // 2
+        popup.move(x, y)
+        popup.show()
+
     # Refresh the status/profile/quality/proxy/scheduler lines shown below the
     # separator in the shared settings sidebar. Called whenever any of the
     # underlying state changes (see _connect_signals for the wired-up signals);
@@ -6225,7 +6769,7 @@ class MainWindow(QMainWindow):
 
         if self.chk_proxy.isChecked():
             host = self.proxy_host_edit.text().strip() or "no host set"
-            proxy_text = f"{host}:{self.proxy_port_spin.value()}"
+            proxy_text = f"{host}:{self.proxy_port_spin.value()} ({self.proxy_protocol_combo.currentText()})"
         else:
             proxy_text = "off"
         self.settings_proxy_label.setText(f"proxy: {proxy_text}")
@@ -8374,14 +8918,25 @@ class MainWindow(QMainWindow):
                 total_seconds += duration_seconds
         size_text = _format_size(total_bytes) if have_size else "0mb"
         self.info_label_1.setText(f"Total size: {size_text}")
+        self.info_label_1.setStyleSheet(
+            sidebar_label_muted_style() if total_bytes else sidebar_label_inactive_style()
+        )
 
         total_minutes = total_seconds // 60
         hours, minutes = divmod(total_minutes, 60)
         runtime_text = f"{hours}:{minutes:02d}"
         self.info_label_3.setText(f"Runtime: {runtime_text}")
+        self.info_label_3.setStyleSheet(
+            sidebar_label_muted_style() if total_seconds else sidebar_label_inactive_style()
+        )
 
         total_kbps = sum(self._download_speeds_kbps.values())
         self.info_label_2.setText(f"Speed: {total_kbps:.1f} KB/s")
+        self.info_label_2.setStyleSheet(
+            sidebar_label_muted_style()
+            if (total_kbps or total_bytes or total_seconds)
+            else sidebar_label_inactive_style()
+        )
 
     # Record (or clear, if kbps is falsy) a link's live download speed in KB/s and
     # refresh the sidebar total; called by the download worker as transfers progress
@@ -8481,7 +9036,7 @@ class MainWindow(QMainWindow):
         item.setData(0, IS_LOAD_MORE_ROLE, True)
         item.setData(0, LOAD_MORE_NODES_ROLE, remaining_nodes)
         batch = min(LINKS_LOAD_BATCH_SIZE, len(remaining_nodes))
-        item.setText(0, f"▾ Load {batch} more... ({len(remaining_nodes)} remaining)")
+        item.setText(0, f"▾ Load {batch} more... ({len(remaining_nodes)} remaining, right click to load all)")
         item.setFlags(Qt.ItemIsEnabled)
         return item
 
@@ -8751,6 +9306,7 @@ class MainWindow(QMainWindow):
     # Enable or disable the proxy host/port fields based on the checkbox
     def _on_proxy_toggled(self, state):
         enabled = bool(state)
+        self.proxy_protocol_combo.setEnabled(enabled)
         self.proxy_host_edit.setEnabled(enabled)
         self.proxy_port_spin.setEnabled(enabled)
 
@@ -8769,11 +9325,17 @@ class MainWindow(QMainWindow):
         self._download_pool.setMaxThreadCount(value)
 
     # Sort key for the profile list: Default always first, then every other profile
-    # alphabetically by type and, within a type, alphabetically by name.
+    # grouped by type in PROFILE_TYPES order (Generic video, Generic file, Playlist,
+    # Channel, Sub Group) and, within a type, alphabetically by name.
     def _profile_sort_key(self, profile):
         if profile["name"] == DEFAULT_PROFILE_NAME:
-            return (0, "", "")
-        return (1, (profile.get("type") or "").lower(), profile["name"].lower())
+            return (0, -1, "")
+        ptype = profile.get("type") or ""
+        try:
+            type_index = PROFILE_TYPES.index(ptype)
+        except ValueError:
+            type_index = len(PROFILE_TYPES)
+        return (1, type_index, profile["name"].lower())
 
     # Repopulate the profile list widget from the in-memory registry, selecting
     # whichever profile is currently active. Sorted with Default pinned on top,
@@ -9056,44 +9618,22 @@ class MainWindow(QMainWindow):
             self._switch_profile(text)
             self._reload_profile_list()
 
-    # "New..." button: ask for a name, then a type, then create and switch to it
+    # "New..." button: single dialog collects name, type, and whatever extra
+    # options that type needs (channel link for Channel, a dynamic list of
+    # channel name+link rows for Sub Group, nothing for the rest) all in one
+    # window, then creates and switches to the resulting profile.
     def _on_new_profile_clicked(self):
-        name, ok = QInputDialog.getText(self, "New Profile", "Profile name:")
-        if not ok:
+        existing_names = [p["name"] for p in self._profiles]
+        dialog = _NewProfileDialog(self, existing_names, self.quality_combo.currentText())
+        if dialog.exec() != QDialog.Accepted or not dialog.result_data:
             return
-        name = _sanitize_profile_name(name.strip())
-        if not name:
-            self._log("New profile: enter a valid name")
-            return
-        if any(p["name"].lower() == name.lower() for p in self._profiles):
-            self._log(f"New profile: '{name}' already exists")
-            return
-        ptype, ok = QInputDialog.getItem(
-            self, "New Profile", "Profile type:", PROFILE_TYPES, 0, False
-        )
-        if not ok:
-            return
-        channel_url = None
-        channels = None
-        if ptype == "Channel":
-            channel_url, ok = QInputDialog.getText(
-                self, "New Profile",
-                "Channel videos or shorts link (e.g. https://www.youtube.com/@name/videos "
-                "or @name/shorts):",
-            )
-            if not ok:
-                return
-            channel_url = channel_url.strip()
-            if not _is_channel_videos_url(channel_url):
-                self._log(
-                    "New profile: channel link must be a channel's \"/videos\" or \"/shorts\" page, "
-                    "e.g. https://www.youtube.com/@name/videos"
-                )
-                return
-        elif ptype == "Sub Group":
-            channels = self._prompt_new_subgroup_channels()
-            if not channels:
-                return
+
+        data = dialog.result_data
+        name = data["name"]
+        ptype = data["type"]
+        channel_url = data["channel_url"]
+        channels = data["channels"]
+
         self._profiles.append({
             "name": name, "type": ptype, "channel_url": channel_url, "channels": channels,
             "number_by_upload_order": False,
@@ -9105,52 +9645,6 @@ class MainWindow(QMainWindow):
         self._reload_profile_list()
         self._log(f"Created profile '{name}' ({ptype})")
         self.profile_combo.setCurrentText(name)
-
-    # Collects one or more {"name","url"} channel entries for a new "Sub Group"
-    # profile: each channel needs a unique name (used as its own sidebar folder
-    # name) and a valid "/videos" or "/shorts" link, same as a plain Channel
-    # profile's own link. Returns None if the user backs out before adding any
-    # channel, otherwise the list of channels collected.
-    def _prompt_new_subgroup_channels(self):
-        channels = []
-        while True:
-            prompt = (
-                "Channel name (used as its sidebar folder name):" if not channels
-                else f"Channel name ({len(channels)} added so far) - another channel:"
-            )
-            name, ok = QInputDialog.getText(self, "New Sub Group", prompt)
-            if not ok:
-                return channels or None
-            name = name.strip()
-            if not name:
-                self._log("New profile: enter a valid channel name")
-                continue
-            if any(c["name"] == name for c in channels):
-                self._log(f"New profile: '{name}' was already added")
-                continue
-
-            url, ok = QInputDialog.getText(
-                self, "New Sub Group",
-                f"'{name}' channel videos or shorts link (e.g. https://www.youtube.com/@name/videos "
-                "or @name/shorts):",
-            )
-            if not ok:
-                return channels or None
-            url = url.strip()
-            if not _is_channel_videos_url(url):
-                self._log(
-                    "New profile: channel link must be a channel's \"/videos\" or \"/shorts\" page, "
-                    "e.g. https://www.youtube.com/@name/videos"
-                )
-                continue
-
-            channels.append({"name": name, "url": url, "quality": self.quality_combo.currentText()})
-            cont = QMessageBox.question(
-                self, "New Sub Group", "Add another channel?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-            )
-            if cont != QMessageBox.Yes:
-                return channels
 
     # "Delete" button: delete whichever profile is selected in the list (or the
     # active one if none is selected)
@@ -9243,6 +9737,7 @@ class MainWindow(QMainWindow):
 
         self.about_name_label.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 16px; font-weight: bold;")
         self.about_description_label.setStyleSheet(sidebar_label_muted_style())
+        self.about_donate_title_label.setStyleSheet(sidebar_label_muted_style())
         self.about_separator_line.setStyleSheet(f"background-color: {BORDER_DISABLED}; border: none;")
         self.about_version_label.setStyleSheet(sidebar_label_muted_style())
         self.about_app_update_text_label.setStyleSheet(sidebar_label_muted_style())
@@ -9283,6 +9778,7 @@ class MainWindow(QMainWindow):
         self.info_label_1.setStyleSheet(sidebar_label_muted_style())
         self.info_label_2.setStyleSheet(sidebar_label_muted_style())
         self.info_label_3.setStyleSheet(sidebar_label_muted_style())
+        self._update_sidebar_info()
         self.session_status_label.setStyleSheet(sidebar_label_muted_style())
         self.preview_label.setStyleSheet(
             f"background-color: {BG_THUMBNAIL}; border: 1px solid {BORDER_THUMBNAIL}; color: {TEXT_FAINT};"

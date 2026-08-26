@@ -11,9 +11,11 @@ Some features are:
 * probing links would rename them, collect info such as size, runtime, thumbnail and ...
 * everything is stored in simple json, can be browsed, or backed up as easy as copying somewhere else
 * no install required, portable, everything self-contained in it's own directory.
-
-![Sample image](sample-image.png)
-
+<br>
+<p align="center">
+  <img src="sample-image.png" width="700">
+</p>
+<br>
 # profiles
 
 Each profile is basically an instance of the program, separate from others in terms of settings, links and thumbnails. Useful for when you want to keep track of certain links, channels or playlists but realistically are only needed on specific times like every few months. The rest of the time it is just cluttering the main page. In this case put it into separate profile and forget about it. It will be there the next time you switch to it.

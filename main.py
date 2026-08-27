@@ -996,13 +996,21 @@ MEMBERS_ONLY_ERROR_HINT = "member"
 
 
 APP_NAME = "ytdlp-links"
-APP_VERSION = "2026.08.24"
+APP_VERSION = "2026.08.27"
 
-# API endpoint this app's own releases will be checked against, mirroring
-# _YTDLP_LATEST_RELEASE_URL/_FFMPEG_LATEST_RELEASE_URL below. Left unset for now -
-# the About tab's app-version check treats that the same as a failed lookup
-# ("could not check for updates") until this is filled in.
-APP_LATEST_RELEASE_URL = None
+# API endpoint this app's own releases are checked against, mirroring
+# _YTDLP_LATEST_RELEASE_URL/_FFMPEG_LATEST_RELEASE_URL below. Release tags on this
+# repo are dates in "YYYY.MM.DD" form (e.g. "2026.08.24", matching APP_VERSION
+# above) rather than semver, so comparing them is a plain string comparison - see
+# get_latest_app_version/_on_app_update_check_finished.
+APP_LATEST_RELEASE_URL = "https://api.github.com/repos/tabclosed/ytdlp-links/releases/latest"
+# Human-browsable page for the same release - offered as a manual-download
+# fallback the same way _YTDLP_RELEASES_PAGE_URL/_FFMPEG_RELEASES_PAGE_URL are.
+APP_RELEASES_PAGE_URL = "https://github.com/tabclosed/ytdlp-links/releases/latest"
+# This app's own repo homepage - the "github" link in the About tab's donate
+# blurb (see _build_about_page/_on_about_donate_label_link_clicked) points here,
+# as opposed to APP_RELEASES_PAGE_URL above which points at a specific release.
+APP_REPO_URL = "https://github.com/tabclosed/ytdlp-links"
 
 
 # Build a urllib opener that routes through proxy, which is a "scheme://host:port"
@@ -1059,10 +1067,10 @@ def _build_proxy_opener(proxy):
     return urllib.request.build_opener(_Socks5HTTPHandler(), _Socks5HTTPSHandler())
 
 
-# Ask wherever this app's releases end up published (see APP_LATEST_RELEASE_URL)
-# for the latest released version ("tag_name"), optionally through proxy. Returns
-# None if the URL isn't configured yet, or on any network/HTTP/parsing failure -
-# same "couldn't check" contract as get_latest_ytdlp_version/get_latest_ffmpeg_version.
+# Ask GitHub for this app's own latest released version ("tag_name", a dated
+# string like "2026.08.24" - see APP_LATEST_RELEASE_URL), optionally through
+# proxy. Returns None on any network/HTTP/parsing failure - same "couldn't
+# check" contract as get_latest_ytdlp_version/get_latest_ffmpeg_version.
 def get_latest_app_version(timeout=8, proxy=None):
     if not APP_LATEST_RELEASE_URL:
         return None
@@ -1077,6 +1085,22 @@ def get_latest_app_version(timeout=8, proxy=None):
         return None
     tag = data.get("tag_name") if isinstance(data, dict) else None
     return tag.strip() if isinstance(tag, str) and tag.strip() else None
+
+
+# Parses a dated app version tag ("2026.08.24", matching APP_VERSION's own
+# format) into a (year, month, day) tuple for chronological comparison, or
+# None if it doesn't look like one - see _on_app_update_check_finished, which
+# needs to know whether a differently-tagged release is actually newer, not
+# just different (a release that predates the running build is entirely
+# possible: e.g. testing a from-source/newer checkout against an older
+# published release, or a published tag being pulled/re-cut backwards).
+def _parse_dated_app_version(version):
+    if not isinstance(version, str):
+        return None
+    parts = version.strip().split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
 
 
 # Name of the local socket used to detect an already-running instance of the app -
@@ -1901,6 +1925,40 @@ def _subprocess_no_window_kwargs():
     return {}
 
 
+# Launches a helper script/executable so it survives this process exiting -
+# used for the self-update installer helper (see
+# MainWindow._perform_app_update_install), which by design has to keep running
+# after this process quits.
+#
+# On Windows this deliberately does NOT use subprocess.Popen with detach-style
+# creationflags (DETACHED_PROCESS/CREATE_NEW_PROCESS_GROUP/
+# CREATE_BREAKAWAY_FROM_JOB). Those all still create the new process as a
+# genuine child of this one, and under a frozen PyInstaller onefile build,
+# onefile's bootloader runs the real app inside a Windows Job Object with
+# "kill on job close" set - any child process is pulled into that same job by
+# default, so the instant this process exits, Windows can tear the helper down
+# right along with it regardless of which detach flags were used.
+# CREATE_BREAKAWAY_FROM_JOB is supposed to excuse a process from that, but
+# isn't always permitted (JOB_OBJECT_LIMIT_BREAKAWAY_OK must be set on the
+# job), and even when CreateProcess itself succeeds, spawning a process with
+# an unusual creationflags combination is exactly the kind of thing endpoint
+# antivirus/SmartScreen heuristics key on, silently killing it with no error
+# surfaced back to us at all.
+#
+# os.startfile sidesteps all of that: it's the same ShellExecute-based launch
+# Explorer performs on a double-click, so the helper is never our child
+# process or in our job to begin with - there's nothing to break away from.
+# cwd is accepted (and ignored) for a consistent call signature with the
+# non-Windows branch below, but isn't passed through to os.startfile - that
+# parameter only exists on Python 3.12+, and it's unnecessary here anyway
+# since the generated helper script only ever uses absolute paths.
+def _spawn_detached_helper(path, cwd=None):
+    if sys.platform == "win32":
+        os.startfile(str(path))
+        return
+    subprocess.Popen([str(path)], close_fds=True, start_new_session=True, cwd=str(cwd) if cwd else None)
+
+
 # Run "yt-dlp --version" and return the reported version string, or None if
 # yt-dlp isn't on PATH or the call fails for any other reason
 def get_ytdlp_version():
@@ -2433,6 +2491,119 @@ def update_ffmpeg(timeout=180, log=None, proxy=None):
     return True, "ffmpeg self-update succeeded"
 
 
+# Filename of the asset published under this app's own GitHub releases (see
+# APP_LATEST_RELEASE_URL) - a single onefile executable, matching how this app
+# is actually built/shipped (see _app_dir's frozen check). This app's release
+# workflow publishes the build under the same fixed name on every release -
+# "ytdlp-links.exe", matching APP_NAME.
+#
+# Windows-only for now - there's no Linux release asset published yet, so
+# update_app refuses outright on Linux/macOS (see its is-Windows guard) rather
+# than looking for one that doesn't exist.
+def _app_release_asset_name():
+    return "ytdlp-links.exe"
+
+
+# Download the latest published build of this app itself (see
+# APP_LATEST_RELEASE_URL/_app_release_asset_name) to a private temp file and
+# return (success, output, downloaded_path). downloaded_path is a Path to the
+# new executable, still sitting in this app's own temp folder (_app_temp_dir) -
+# not yet installed, since actually swapping it in for the running executable
+# requires the app to close (see MainWindow._perform_app_update_install, which
+# handles that part on the GUI thread once this download has finished).
+#
+# Unlike update_ytdlp/update_ffmpeg, this only ever runs against a frozen
+# (PyInstaller) build - there's no "running executable" to replace when this
+# module is just being run as a plain script, so that case is refused up front
+# rather than downloading something with nowhere useful to go. Windows-only
+# for the same reason - see _app_release_asset_name.
+def update_app(timeout=180, log=None, proxy=None):
+    if log is None:
+        log = lambda _msg: None
+
+    if not getattr(sys, "frozen", False):
+        log("Self-update isn't available when running from source - not a packaged build")
+        return False, "Self-update isn't available when running from source - not a packaged build", None
+
+    if sys.platform != "win32":
+        log(f"Self-update isn't available on this platform yet - no {APP_NAME} release is published for it")
+        return (
+            False,
+            f"Self-update isn't available on this platform yet - no {APP_NAME} release is published for it",
+            None,
+        )
+
+    asset_name = _app_release_asset_name()
+    common_headers = {"User-Agent": "Mozilla/5.0 (compatible; app-updater)"}
+
+    log(f"Looking up latest {APP_NAME} release ({asset_name})…")
+    request = urllib.request.Request(
+        APP_LATEST_RELEASE_URL,
+        headers={**common_headers, "Accept": "application/vnd.github+json"},
+    )
+    try:
+        opener = _build_proxy_opener(proxy)
+        with opener.open(request, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError) as e:
+        log(f"Failed to look up latest {APP_NAME} release: {e}")
+        return False, f"Failed to look up latest {APP_NAME} release: {e}", None
+
+    asset_url = None
+    for asset in (data.get("assets") or []) if isinstance(data, dict) else []:
+        if isinstance(asset, dict) and asset.get("name") == asset_name:
+            asset_url = asset.get("browser_download_url")
+            break
+    if not asset_url:
+        log(f'Could not find a "{asset_name}" asset in the latest {APP_NAME} release')
+        return False, f'Could not find a "{asset_name}" asset in the latest {APP_NAME} release', None
+
+    # Downloaded into a *named* (not auto-deleted) subfolder of _app_temp_dir,
+    # rather than a TemporaryDirectory like update_ytdlp/update_ffmpeg use - the
+    # file needs to survive past this function returning, since it's only
+    # actually installed later (after this process exits) by a detached helper
+    # process - see MainWindow._perform_app_update_install.
+    download_dir = _app_temp_dir() / "app_update"
+    try:
+        download_dir.mkdir(parents=True, exist_ok=True)
+        # Clear out anything left over from a previous attempt so a stale
+        # partial file can't be mistaken for a resumable one, or linger
+        # forever if the asset name ever changes.
+        for old in download_dir.iterdir():
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        dest_path = download_dir / asset_name
+        log(f"Downloading {asset_name}…")
+        try:
+            content_type, expected_size = _download_with_resume(
+                opener, asset_url, dest_path, common_headers, timeout, log,
+            )
+        except OSError as e:
+            log(f"{APP_NAME} download failed: {e}")
+            return False, f"{APP_NAME} download failed: {e}", None
+
+        size = dest_path.stat().st_size if dest_path.exists() else 0
+        if size == 0 or (expected_size is not None and size != expected_size):
+            detail = f"got {size} of {expected_size if expected_size is not None else '?'} bytes"
+            log(f"{APP_NAME} download did not produce a complete file ({detail})")
+            return False, f"{APP_NAME} download did not produce a complete file ({detail})", None
+
+        if sys.platform != "win32":
+            try:
+                dest_path.chmod(dest_path.stat().st_mode | 0o111)  # carry over the +x bit
+            except OSError as e:
+                log(f"Failed to mark the downloaded update executable: {e}")
+                return False, f"Failed to mark the downloaded update executable: {e}", None
+    except OSError as e:
+        log(f"{APP_NAME} download failed: {e}")
+        return False, f"{APP_NAME} download failed: {e}", None
+
+    log(f"{APP_NAME} download succeeded - close the app to install it")
+    return True, f"{APP_NAME} download succeeded", dest_path
+
+
 # Matches yt-dlp's default progress line, e.g. "[download]  12.3% of  50.00MiB at  1.20MiB/s ETA 00:30"
 _DOWNLOAD_PROGRESS_RE = re.compile(r"\[download\]\s+([\d.]+)%")
 _DOWNLOAD_SPEED_RE = re.compile(r"at\s+([\d.]+)(Ki|Mi|Gi)?B/s")
@@ -2818,8 +2989,8 @@ class AppUpdateCheckSignals(QObject):
     finished = Signal(object)
 
 
-# Looks up the latest published app version on a worker thread. There's no
-# equivalent "update" task for the app itself yet - see get_latest_app_version.
+# Looks up the latest published app version on a worker thread - see
+# get_latest_app_version.
 class AppUpdateCheckTask(QRunnable):
     def __init__(self, proxy=None):
         super().__init__()
@@ -2829,6 +3000,36 @@ class AppUpdateCheckTask(QRunnable):
     def run(self):
         latest = get_latest_app_version(proxy=self.proxy)
         _safe_emit(self.signals.finished, latest)
+
+
+# Cross-thread signal carrier for the About tab's manual app update
+class AppUpdateSignals(QObject):
+    # One line of progress as the download proceeds - see update_app's log callback
+    step = Signal(str)
+    # success, combined output, and the downloaded executable's path (a Path, or
+    # None on failure) - see update_app. Unlike YtdlpUpdateSignals/
+    # FfmpegUpdateSignals there's no "version now installed" to report here: the
+    # download alone doesn't install anything yet, so the version stays whatever
+    # it was until MainWindow._perform_app_update_install actually swaps it in
+    # and restarts.
+    finished = Signal(bool, str, object)
+
+
+# Downloads the latest build of this app itself on a worker thread, reporting
+# progress via AppUpdateSignals.step and the final result via .finished. Actually
+# installing the download and restarting only happens afterwards, on the GUI
+# thread - see MainWindow._on_app_update_download_finished.
+class AppUpdateTask(QRunnable):
+    def __init__(self, proxy=None):
+        super().__init__()
+        self.proxy = proxy
+        self.signals = AppUpdateSignals()
+
+    def run(self):
+        success, output, downloaded_path = update_app(
+            log=lambda msg: _safe_emit(self.signals.step, msg), proxy=self.proxy,
+        )
+        _safe_emit(self.signals.finished, success, output, downloaded_path)
 
 
 # Cross-thread signal carrier for a single probe task's result/error
@@ -3791,6 +3992,17 @@ class MainWindow(QMainWindow):
         # Same as _ytdlp_update_task above, but for the ffmpeg update triggered from
         # the About tab's ffmpeg "click to update" link
         self._ffmpeg_update_task = None
+        # Same as _ytdlp_update_task above, but for the app's own self-update
+        # triggered from the About tab's "click to update" link - tracks the
+        # *download* half only (see AppUpdateTask); once it finishes, install +
+        # restart happens immediately without a separate task to guard against
+        # (the app is gone by the time that would matter)
+        self._app_update_task = None
+        # Path to a downloaded-but-not-yet-installed app update (set by
+        # _on_app_update_download_finished when the user declines to restart
+        # immediately), so the "click to restart and finish installing" link can
+        # still find it later without downloading it all over again
+        self._pending_app_update_path = None
         # Whether the log header's " — UI ready" is currently swapped for a clickable
         # " — update available" (see _set_log_header) - tracked so _reset_log can
         # reapply it after the log is cleared
@@ -4633,12 +4845,16 @@ class MainWindow(QMainWindow):
 
         self.about_donate_label = QLabel(
             "ytdlp-links is provided free of charge with source code "
-            "available under GPLv3 licence on github. If this program has been "
+            f'available under GPLv3 licence on <a href="github" style="color: {BORDER_FOCUS}; '
+            'text-decoration: underline;">github</a>. If this program has been '
             "useful to you in any way consider donating using one of the methods "
             "below:"
         )
         self.about_donate_label.setWordWrap(True)
         self.about_donate_label.setStyleSheet(sidebar_label_muted_style())
+        self.about_donate_label.setTextFormat(Qt.RichText)
+        self.about_donate_label.setTextInteractionFlags(Qt.LinksAccessibleByMouse)
+        self.about_donate_label.linkActivated.connect(self._on_about_donate_label_link_clicked)
         layout.addWidget(self.about_donate_label)
 
         self.about_donate_toggle_label = QLabel(
@@ -4681,9 +4897,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.about_version_label)
 
         # Tree-style status line under "app version: ..." - same pattern as the
-        # yt-dlp/ffmpeg ones below (see _start_app_update_check), except with no
-        # "click to update" link, since there's no in-place update mechanism for
-        # the app itself yet (see get_latest_app_version/APP_LATEST_RELEASE_URL).
+        # yt-dlp/ffmpeg ones below (see _start_app_update_check/_start_app_update).
         app_update_row = QWidget()
         app_update_row_layout = QHBoxLayout(app_update_row)
         app_update_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -5012,9 +5226,10 @@ class MainWindow(QMainWindow):
                 f'<a href="update" style="color: {BORDER_FOCUS}; text-decoration: underline;">click to retry</a>'
             )
 
-    # Same idea as _start_ytdlp_update_check, but for the app's own version. There's
-    # no update task to trigger yet - see get_latest_app_version/APP_LATEST_RELEASE_URL,
-    # which will be filled in once the app has somewhere to publish releases to.
+    # Same idea as _start_ytdlp_update_check, but for the app's own version - see
+    # get_latest_app_version/APP_LATEST_RELEASE_URL. Runs automatically once at
+    # app startup (see __init__), every 6 hours after that (see
+    # _on_scheduler_tick), and again any time "click to retry" is used.
     def _start_app_update_check(self):
         self.about_app_update_text_label.setText("└── checking for updates…")
         self.about_app_update_link_label.setText("")
@@ -5022,25 +5237,246 @@ class MainWindow(QMainWindow):
         task.signals.finished.connect(self._on_app_update_check_finished)
         QThreadPool.globalInstance().start(task)
 
-    # Reports the result of _start_app_update_check back on the GUI thread
+    # Reports the result of _start_app_update_check back on the GUI thread.
+    # Release tags are dated ("2026.08.24", see APP_VERSION) rather than
+    # semver, so "newer" is a real chronological comparison via
+    # _parse_dated_app_version - NOT just "different from what's installed",
+    # since a published release can easily be older than what's currently
+    # running (e.g. a from-source checkout ahead of the last publish, or a tag
+    # that got re-cut backwards) and that shouldn't be reported as an update.
     def _on_app_update_check_finished(self, latest_version):
+        current_parsed = _parse_dated_app_version(APP_VERSION)
+        latest_parsed = _parse_dated_app_version(latest_version)
+
         if not latest_version:
             self.about_app_update_text_label.setText("└── could not check for updates")
             self.about_app_update_link_label.setText(
                 f'<a href="check" style="color: {BORDER_FOCUS}; text-decoration: underline;">click to retry</a>'
             )
-        elif latest_version == APP_VERSION:
+        elif latest_version == APP_VERSION or (
+            # Falls back to exact-match-only when either side doesn't parse as a
+            # date (so a malformed/unexpected tag is still handled sanely rather
+            # than crashing or silently mis-comparing), rather than assuming
+            # unparseable-but-different means "newer".
+            current_parsed is not None and latest_parsed is not None and latest_parsed <= current_parsed
+        ):
             self.about_app_update_text_label.setText("└── up to date")
+            self.about_app_update_link_label.setText("")
+        elif not getattr(sys, "frozen", False):
+            # Self-update replaces the running executable (see
+            # _perform_app_update_install) - nothing to replace when this is
+            # just a script, so there's no "click to update" link to offer here.
+            self.about_app_update_text_label.setText(
+                f"└── new version available: {latest_version} (run a packaged build to update)"
+            )
+            self.about_app_update_link_label.setText("")
+        elif sys.platform != "win32":
+            # No Linux/macOS release asset is published yet - see
+            # _app_release_asset_name/update_app's platform guard.
+            self.about_app_update_text_label.setText(
+                f"└── new version available: {latest_version} (not yet published for this platform)"
+            )
             self.about_app_update_link_label.setText("")
         else:
             self.about_app_update_text_label.setText(f"└── new version available: {latest_version}")
-            self.about_app_update_link_label.setText("")
+            self.about_app_update_link_label.setText(
+                f'<a href="update" style="color: {BORDER_FOCUS}; text-decoration: underline;">click to update</a>'
+            )
 
-    # Handles the "click to retry" link next to the app-version tree-style status
-    # line (there's no "update" link yet - see _on_app_update_check_finished)
+    # Handles both links that can appear next to the app-version tree-style status
+    # line, same as _on_ytdlp_update_link_clicked
     def _on_app_update_link_clicked(self, href):
         if href == "check":
             self._start_app_update_check()
+        elif href == "update":
+            self._start_app_update()
+        elif href == "restart" and self._pending_app_update_path is not None:
+            self._perform_app_update_install(self._pending_app_update_path)
+
+    # Downloads the latest build of this app in the background (see
+    # AppUpdateTask/update_app); once it's finished, install + restart happens
+    # right away in _on_app_update_download_finished. Guards against
+    # double-clicks via _app_update_task, same as _start_ytdlp_update.
+    def _start_app_update(self):
+        if self._app_update_task is not None:
+            return
+        self.about_app_update_text_label.setText("└── downloading update…")
+        self.about_app_update_link_label.setText("")
+        self._log(f"Starting {APP_NAME} update…")
+        task = AppUpdateTask(proxy=self._current_proxy())
+        task.signals.step.connect(self._on_app_update_step)
+        task.signals.finished.connect(self._on_app_update_download_finished)
+        self._app_update_task = task
+        QThreadPool.globalInstance().start(task)
+
+    # Logs one line of update progress as it happens (see update_app's log callback)
+    def _on_app_update_step(self, message):
+        self._log(message)
+
+    # Reports the result of _start_app_update's download half back on the GUI
+    # thread. On success, confirms with the user before actually installing it -
+    # unlike the yt-dlp/ffmpeg updates, installing this one means closing the app
+    # out from under them, so it doesn't just happen silently the way those do.
+    def _on_app_update_download_finished(self, success, output, downloaded_path):
+        self._app_update_task = None
+        self._log(f"{APP_NAME} update download {'succeeded' if success else 'failed'}")
+        if not success:
+            self.about_app_update_text_label.setText("└── update failed - see log")
+            self.about_app_update_link_label.setText(
+                f'<a href="update" style="color: {BORDER_FOCUS}; text-decoration: underline;">click to retry</a>'
+            )
+            return
+
+        self.about_app_update_text_label.setText("└── update downloaded")
+        self.about_app_update_link_label.setText("")
+
+        choice = QMessageBox.question(
+            self,
+            f"Update {APP_NAME}",
+            f"The update has been downloaded. {APP_NAME} needs to close to finish "
+            "installing it - it won't reopen automatically, so you'll need to "
+            "start it again yourself afterwards.\n\nClose now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if choice != QMessageBox.Yes:
+            self.about_app_update_link_label.setText(
+                f'<a href="restart" style="color: {BORDER_FOCUS}; text-decoration: underline;">click to close and finish installing</a>'
+            )
+            self._pending_app_update_path = downloaded_path
+            return
+
+        self._perform_app_update_install(downloaded_path)
+
+    # Swaps the downloaded executable (downloaded_path, from update_app) in for
+    # the one currently running, then quits this process. Never returns on
+    # success - the app is gone by the time this would.
+    #
+    # Windows-only for now, matching update_app/_app_release_asset_name (no
+    # Linux/macOS release asset is published yet - this is never reached on
+    # those platforms since _on_app_update_check_finished doesn't offer a
+    # "click to update" link there in the first place).
+    #
+    # The running .exe can't just be overwritten directly - it's locked open by
+    # this very process - so this hands off to a short-lived, self-deleting
+    # helper .bat, launched detached so it survives this process exiting, which
+    # is exactly what it waits for before moving the new file into place.
+    #
+    # "Detached" launch flags alone aren't actually enough to make that work
+    # reliably under a frozen PyInstaller onefile build - see
+    # _spawn_detached_helper for why, and how it sidesteps the problem via
+    # os.startfile rather than raw CreateProcess flags.
+    #
+    # Deliberately does NOT relaunch the app itself once the move is done - only
+    # tells the user the update is installed and they can start it. Launching
+    # the freshly-moved exe programmatically from here (whether via cmd's
+    # "start", a direct call, or anything else tried) was intermittently
+    # producing a "Failed to load Python DLL"/"module could not be found" error
+    # from PyInstaller's own onefile self-extraction that never happened when
+    # the exact same exe was opened by hand moments later - a real, reproducible
+    # difference nothing so far has pinned down (job objects, PID reuse, and
+    # antivirus were all ruled out or made no difference). Rather than keep
+    # guessing at how to launch it, a manual first launch after installing
+    # sidesteps the problem entirely.
+    #
+    # The helper is deliberately verbose (every command echoed, each phase
+    # narrated, real move output shown rather than swallowed into nul) and
+    # pauses on a keypress before it does anything else - including
+    # self-deleting - rather than closing on its own the instant it's done.
+    # This is a debugging aid: it's the only way to actually see why a step
+    # failed, since a window that closes itself the moment something goes
+    # wrong closes long before anyone can read what it printed.
+    def _perform_app_update_install(self, downloaded_path):
+        current_exe = Path(sys.executable).resolve()
+        downloaded_path = Path(downloaded_path)
+        pid = os.getpid()
+
+        self._log(f"Installing {APP_NAME} update…")
+
+        try:
+            helper_path = _app_temp_dir() / "app_update" / "install_update.bat"
+            helper_script = (
+                "@echo on\r\n"
+                "setlocal\r\n"
+                f'set "PID={pid}"\r\n'
+                f'set "NEWEXE={downloaded_path}"\r\n'
+                f'set "TARGETEXE={current_exe}"\r\n'
+                "echo ==== ytdlp-links update installer ====\r\n"
+                "echo Waiting for PID %PID% to exit...\r\n"
+                "echo NEWEXE=%NEWEXE%\r\n"
+                "echo TARGETEXE=%TARGETEXE%\r\n"
+                "set waitcount=0\r\n"
+                ":waitproc\r\n"
+                "set /a waitcount+=1\r\n"
+                "echo [wait attempt %waitcount%] checking tasklist for PID %PID%...\r\n"
+                'tasklist /FI "PID eq %PID%"\r\n'
+                'tasklist /FI "PID eq %PID%" 2>NUL | find /I "%PID%" >NUL\r\n'
+                "if not errorlevel 1 (\r\n"
+                "    if %waitcount% GEQ 30 (\r\n"
+                "        echo Gave up waiting for PID %PID% to exit - trying the move anyway.\r\n"
+                "        goto movefile\r\n"
+                "    )\r\n"
+                "    timeout /t 1 /nobreak >nul\r\n"
+                "    goto waitproc\r\n"
+                ")\r\n"
+                "echo PID %PID% has exited.\r\n"
+                # A short buffer in case PyInstaller onefile's background
+                # extraction-folder cleanup for the just-exited process is still
+                # finishing up (its temp folder name is derived from the PID,
+                # which Windows can reuse quickly) - cheap to wait for.
+                "timeout /t 3 /nobreak >nul\r\n"
+                ":movefile\r\n"
+                "set movecount=0\r\n"
+                ":retrymove\r\n"
+                "set /a movecount+=1\r\n"
+                "echo [move attempt %movecount%] moving \"%NEWEXE%\" -^> \"%TARGETEXE%\"...\r\n"
+                'if not exist "%NEWEXE%" echo WARNING: NEWEXE does not exist at this path!\r\n'
+                'move /Y "%NEWEXE%" "%TARGETEXE%"\r\n'
+                "if errorlevel 1 (\r\n"
+                "    echo Move failed with errorlevel %errorlevel%.\r\n"
+                "    if %movecount% GEQ 15 (\r\n"
+                "        echo Giving up after %movecount% attempts.\r\n"
+                "        goto cleanup\r\n"
+                "    )\r\n"
+                "    timeout /t 1 /nobreak >nul\r\n"
+                "    goto retrymove\r\n"
+                ")\r\n"
+                "echo Move succeeded.\r\n"
+                # Everything above this point is @echo on's blow-by-blow of
+                # every command that ran - useful for debugging, but it means
+                # the final result is easy to miss, scrolled off among dozens of
+                # echoed lines. Clearing the screen here makes the actual
+                # takeaway the only thing left on screen, instead of one more
+                # line lost in the noise above it.
+                "cls\r\n"
+                "@echo off\r\n"
+                "echo.\r\n"
+                "echo ================================================\r\n"
+                "echo.\r\n"
+                "echo     UPDATE COMPLETE\r\n"
+                "echo.\r\n"
+                "echo     You can start ytdlp-links now.\r\n"
+                "echo.\r\n"
+                "echo     Press any key to close this window...\r\n"
+                "echo.\r\n"
+                "echo ================================================\r\n"
+                "echo.\r\n"
+                ":cleanup\r\n"
+                "pause >nul\r\n"
+                'del "%~f0"\r\n'
+            )
+            helper_path.parent.mkdir(parents=True, exist_ok=True)
+            helper_path.write_text(helper_script, encoding="utf-8")
+            _spawn_detached_helper(helper_path, cwd=current_exe.parent)
+        except OSError as e:
+            self._log(f"Failed to launch the {APP_NAME} update installer: {e}")
+            self.about_app_update_text_label.setText("└── update failed - see log")
+            self.about_app_update_link_label.setText(
+                f'<a href="update" style="color: {BORDER_FOCUS}; text-decoration: underline;">click to retry</a>'
+            )
+            return
+
+        QApplication.instance().quit()
 
     # Checked once per launch (see main()): this app no longer ships yt-dlp/ffmpeg
     # inside its own .exe (see _bundled_bin_dir), so a fresh install starts out
@@ -5134,6 +5570,13 @@ class MainWindow(QMainWindow):
         }.get(href)
         if url:
             QDesktopServices.openUrl(QUrl(url))
+
+    # Opens this app's own GitHub repo (the "github" link in the About tab's
+    # donate blurb - see _build_about_page) in the user's default browser, same
+    # pattern as _on_missing_binaries_link_clicked
+    def _on_about_donate_label_link_clicked(self, href):
+        if href == "github":
+            QDesktopServices.openUrl(QUrl(APP_REPO_URL))
 
     # Create a form label and register it in the settings search index
     def _settings_label(self, text, tab_index):

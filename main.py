@@ -965,6 +965,13 @@ PROFILE_LIST_SEPARATOR_ROLE = Qt.UserRole + 26
 # and append any videos added to it since. None for a folder that wasn't created
 # from a playlist link (a manually-created folder, a Channel/Sub Group folder, etc).
 PLAYLIST_SOURCE_URL_ROLE = Qt.UserRole + 27
+# A non-folder item's rendered "prefix" - everything _renumber_siblings puts before
+# the progress/title portion (its number or [Skip]/[Done] status, any "-- "/
+# "[Ns] - "/"[Force Quality] " decoration) - cached here each time a real renumber
+# computes it, so a download-progress tick (see _update_item_progress_display) can
+# redraw just this one row's text without re-walking the whole tree to work out
+# where in the numbering it belongs.
+LINE_PREFIX_ROLE = Qt.UserRole + 28
 # How many sibling items (top-level, or children of one folder) are materialized into
 # real QTreeWidgetItems at once when loading from disk. Building thousands of items
 # synchronously on startup freezes the UI, so any run longer than this is loaded in
@@ -996,13 +1003,21 @@ MEMBERS_ONLY_ERROR_HINT = "member"
 
 
 APP_NAME = "ytdlp-links"
-APP_VERSION = "2026.08.24"
+APP_VERSION = "2026.09.09"
 
-# API endpoint this app's own releases will be checked against, mirroring
-# _YTDLP_LATEST_RELEASE_URL/_FFMPEG_LATEST_RELEASE_URL below. Left unset for now -
-# the About tab's app-version check treats that the same as a failed lookup
-# ("could not check for updates") until this is filled in.
-APP_LATEST_RELEASE_URL = None
+# API endpoint this app's own releases are checked against, mirroring
+# _YTDLP_LATEST_RELEASE_URL/_FFMPEG_LATEST_RELEASE_URL below. Release tags on this
+# repo are dates in "YYYY.MM.DD" form (e.g. "2026.08.24", matching APP_VERSION
+# above) rather than semver, so comparing them is a plain string comparison - see
+# get_latest_app_version/_on_app_update_check_finished.
+APP_LATEST_RELEASE_URL = "https://api.github.com/repos/tabclosed/ytdlp-links/releases/latest"
+# Human-browsable page for the same release - offered as a manual-download
+# fallback the same way _YTDLP_RELEASES_PAGE_URL/_FFMPEG_RELEASES_PAGE_URL are.
+APP_RELEASES_PAGE_URL = "https://github.com/tabclosed/ytdlp-links/releases/latest"
+# This app's own repo homepage - the "github" link in the About tab's donate
+# blurb (see _build_about_page/_on_about_donate_label_link_clicked) points here,
+# as opposed to APP_RELEASES_PAGE_URL above which points at a specific release.
+APP_REPO_URL = "https://github.com/tabclosed/ytdlp-links"
 
 
 # Build a urllib opener that routes through proxy, which is a "scheme://host:port"
@@ -1059,10 +1074,10 @@ def _build_proxy_opener(proxy):
     return urllib.request.build_opener(_Socks5HTTPHandler(), _Socks5HTTPSHandler())
 
 
-# Ask wherever this app's releases end up published (see APP_LATEST_RELEASE_URL)
-# for the latest released version ("tag_name"), optionally through proxy. Returns
-# None if the URL isn't configured yet, or on any network/HTTP/parsing failure -
-# same "couldn't check" contract as get_latest_ytdlp_version/get_latest_ffmpeg_version.
+# Ask GitHub for this app's own latest released version ("tag_name", a dated
+# string like "2026.08.24" - see APP_LATEST_RELEASE_URL), optionally through
+# proxy. Returns None on any network/HTTP/parsing failure - same "couldn't
+# check" contract as get_latest_ytdlp_version/get_latest_ffmpeg_version.
 def get_latest_app_version(timeout=8, proxy=None):
     if not APP_LATEST_RELEASE_URL:
         return None
@@ -1077,6 +1092,22 @@ def get_latest_app_version(timeout=8, proxy=None):
         return None
     tag = data.get("tag_name") if isinstance(data, dict) else None
     return tag.strip() if isinstance(tag, str) and tag.strip() else None
+
+
+# Parses a dated app version tag ("2026.08.24", matching APP_VERSION's own
+# format) into a (year, month, day) tuple for chronological comparison, or
+# None if it doesn't look like one - see _on_app_update_check_finished, which
+# needs to know whether a differently-tagged release is actually newer, not
+# just different (a release that predates the running build is entirely
+# possible: e.g. testing a from-source/newer checkout against an older
+# published release, or a published tag being pulled/re-cut backwards).
+def _parse_dated_app_version(version):
+    if not isinstance(version, str):
+        return None
+    parts = version.strip().split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    return tuple(int(p) for p in parts)
 
 
 # Name of the local socket used to detect an already-running instance of the app -
@@ -1562,10 +1593,15 @@ def load_profile_metadata(name):
 # "number_by_upload_order" is also Sub Group-only: when set, downloads across every
 # channel in the group are numbered and pulled in oldest-upload-first order instead
 # of top-to-bottom tree order (see _subgroup_upload_order_map).
-def save_profile_metadata(name, ptype, channel_url, channels=None, number_by_upload_order=False):
+# "playlist_url" is "Playlist"-only: the playlist link supplied at creation time (see
+# _NewProfileDialog._build_playlist_page) - once set, it's what locks the URL bar
+# read-only for this profile going forward (see _update_url_line_edit_for_profile),
+# same as "channel_url" already does for a Channel profile.
+def save_profile_metadata(name, ptype, channel_url, channels=None, number_by_upload_order=False,
+                           playlist_url=None):
     _save_json_file(_dir_for_profile(name) / PROFILE_METADATA_FILENAME, {
         "name": name, "type": ptype, "channel_url": channel_url, "channels": channels,
-        "number_by_upload_order": bool(number_by_upload_order),
+        "number_by_upload_order": bool(number_by_upload_order), "playlist_url": playlist_url,
     })
 
 
@@ -1584,6 +1620,7 @@ def _discover_profiles():
         "channel_url": default_meta.get("channel_url"),
         "channels": default_meta.get("channels"),
         "number_by_upload_order": bool(default_meta.get("number_by_upload_order")),
+        "playlist_url": default_meta.get("playlist_url"),
     })
 
     profiles_root = _app_dir() / PROFILES_DIRNAME
@@ -1600,6 +1637,7 @@ def _discover_profiles():
                 "channel_url": meta.get("channel_url"),
                 "channels": meta.get("channels"),
                 "number_by_upload_order": bool(meta.get("number_by_upload_order")),
+                "playlist_url": meta.get("playlist_url"),
             })
     return profiles
 
@@ -2433,6 +2471,7 @@ def update_ffmpeg(timeout=180, log=None, proxy=None):
     return True, "ffmpeg self-update succeeded"
 
 
+# Filename of the asset published under this app's own GitHub releases (see
 # Matches yt-dlp's default progress line, e.g. "[download]  12.3% of  50.00MiB at  1.20MiB/s ETA 00:30"
 _DOWNLOAD_PROGRESS_RE = re.compile(r"\[download\]\s+([\d.]+)%")
 _DOWNLOAD_SPEED_RE = re.compile(r"at\s+([\d.]+)(Ki|Mi|Gi)?B/s")
@@ -2818,8 +2857,8 @@ class AppUpdateCheckSignals(QObject):
     finished = Signal(object)
 
 
-# Looks up the latest published app version on a worker thread. There's no
-# equivalent "update" task for the app itself yet - see get_latest_app_version.
+# Looks up the latest published app version on a worker thread - see
+# get_latest_app_version.
 class AppUpdateCheckTask(QRunnable):
     def __init__(self, proxy=None):
         super().__init__()
@@ -3339,7 +3378,10 @@ class SettingsSearchLineEdit(QLineEdit):
 # Sidebar label showing the active profile ("Profile: <name>"). On hover it
 # appends a "click to change" hint (without baking that hint into the real
 # text - see setText), and clicking it emits `clicked` so MainWindow can pop
-# up the quick profile-switch dialog (see _show_profile_switch_popup).
+# up the quick profile-switch dialog (see _show_profile_switch_popup). Text
+# too wide for the label's current width - name and/or hint - is elided with
+# "..." (full text kept as a tooltip) rather than letting the sidebar grow and
+# become horizontally scrollable, same reasoning as MainWindow._set_elided_text.
 class ProfileLabel(QLabel):
     clicked = Signal()
 
@@ -3363,11 +3405,24 @@ class ProfileLabel(QLabel):
 
     # Keep the real ("base") text separate from what's displayed, so callers
     # updating this label (e.g. _update_profile_label) never need to know
-    # about the hover hint, and leaving/re-entering doesn't lose it.
+    # about the hover hint or the eliding done in _apply_display_text.
     def setText(self, text):
         self._base_text = text
+        self._apply_display_text()
+
+    # Renders whichever of "Profile: <n>" / "Profile: <n> — click to change"
+    # currently applies, eliding it to fit the label's actual width (that
+    # width isn't known yet the first time this runs, before the label has
+    # been laid out - resizeEvent below re-applies once it is). The hint is
+    # folded in *before* eliding (not appended after) so hovering never makes
+    # an already-fitting line spill back over.
+    def _apply_display_text(self):
         show_hint = self.underMouse() or self._popup_open
-        super().setText(f"{text} \u2014 click to change" if show_hint else text)
+        full = f"{self._base_text} \u2014 click to change" if show_hint else self._base_text
+        width = self.width()
+        elided = self.fontMetrics().elidedText(full, Qt.TextElideMode.ElideRight, width) if width > 0 else full
+        super().setText(elided)
+        self.setToolTip(self._base_text if elided != full else "")
 
     # Called by MainWindow when the profile-switch popup opens/closes. While
     # open, the hint stays regardless of hover/timer state; on close, revert
@@ -3377,14 +3432,14 @@ class ProfileLabel(QLabel):
         self._popup_open = open_
         if open_:
             self._revert_timer.stop()
-            super().setText(f"{self._base_text} \u2014 click to change")
+            self._apply_display_text()
         elif not self.underMouse():
             self._revert_text()
 
     def enterEvent(self, event):
         super().enterEvent(event)
         self._revert_timer.stop()
-        super().setText(f"{self._base_text} \u2014 click to change")
+        self._apply_display_text()
 
     # Don't revert right away - start a short delay instead, so a mouse that
     # merely passes over the label and back doesn't cause a flicker. Skipped
@@ -3396,7 +3451,14 @@ class ProfileLabel(QLabel):
         self._revert_timer.start()
 
     def _revert_text(self):
-        super().setText(self._base_text)
+        self._apply_display_text()
+
+    # Re-elide whenever the label's available width changes (window/sidebar
+    # resize) - the width _apply_display_text elides against is only ever
+    # correct after layout has actually assigned the label a size.
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_display_text()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -3487,14 +3549,16 @@ class _NewProfileDialog(QDialog):
         layout.addLayout(form)
 
         # Stacked area holding each type's extra options - only one widget per
-        # distinct set of options; the three types with nothing extra to ask
-        # (Generic video/file, Playlist) all share the same empty page.
+        # distinct set of options; the two types with nothing extra to ask
+        # (Generic video, Generic file) share the same empty page.
         self.options_stack = QStackedWidget()
         self._page_empty = self._build_empty_page()
         self._page_channel = self._build_channel_page()
+        self._page_playlist = self._build_playlist_page()
         self._page_subgroup = self._build_subgroup_page()
         self.options_stack.addWidget(self._page_empty)
         self.options_stack.addWidget(self._page_channel)
+        self.options_stack.addWidget(self._page_playlist)
         self.options_stack.addWidget(self._page_subgroup)
         layout.addWidget(self.options_stack)
 
@@ -3565,6 +3629,36 @@ class _NewProfileDialog(QDialog):
         )
         self.channel_url_edit.setStyleSheet(settings_input_style())
         v.addRow("Channel link:", self.channel_url_edit)
+        return page
+
+    # A Playlist profile's link, quality, and numbering are all collected up front
+    # here rather than left for the user to paste/adjust afterwards - once created,
+    # the URL bar is locked read-only for this profile (see
+    # _update_url_line_edit_for_profile) the same way it already is for Channel/Sub
+    # Group, since new videos only ever come in via "Refresh", not a manual paste.
+    def _build_playlist_page(self):
+        page = QWidget()
+        v = QFormLayout(page)
+        v.setContentsMargins(0, 4, 0, 0)
+
+        self.playlist_url_edit = QLineEdit()
+        self.playlist_url_edit.setPlaceholderText(
+            "https://www.youtube.com/playlist?list=..."
+        )
+        self.playlist_url_edit.setStyleSheet(settings_input_style())
+        v.addRow("Playlist link:", self.playlist_url_edit)
+
+        self.playlist_quality_combo = NoScrollComboBox()
+        self.playlist_quality_combo.addItems([QUALITY_AUDIO_ONLY, *QUALITY_HEIGHTS, QUALITY_BEST])
+        self.playlist_quality_combo.setCurrentText(self._default_quality)
+        self.playlist_quality_combo.setStyleSheet(settings_input_style())
+        v.addRow("Quality:", self.playlist_quality_combo)
+
+        self.playlist_numbering_checkbox = QCheckBox("Number playlist downloads (as uploader intended)")
+        self.playlist_numbering_checkbox.setChecked(True)
+        self.playlist_numbering_checkbox.setStyleSheet(checkbox_style())
+        v.addRow("", self.playlist_numbering_checkbox)
+
         return page
 
     # Minimal borderless layout: no per-row box, just a hairline separator
@@ -3663,6 +3757,8 @@ class _NewProfileDialog(QDialog):
         self.error_label.setText("")
         if ptype == "Channel":
             self.options_stack.setCurrentWidget(self._page_channel)
+        elif ptype == "Playlist":
+            self.options_stack.setCurrentWidget(self._page_playlist)
         elif ptype == "Sub Group":
             self.options_stack.setCurrentWidget(self._page_subgroup)
         else:
@@ -3686,6 +3782,9 @@ class _NewProfileDialog(QDialog):
         ptype = self._current_type()
         channel_url = None
         channels = None
+        playlist_url = None
+        playlist_quality = None
+        playlist_numbering = True
 
         if ptype == "Channel":
             channel_url = self.channel_url_edit.text().strip()
@@ -3695,6 +3794,16 @@ class _NewProfileDialog(QDialog):
                     "e.g. https://www.youtube.com/@name/videos"
                 )
                 return
+        elif ptype == "Playlist":
+            playlist_url = self.playlist_url_edit.text().strip()
+            if not _is_playlist_url(playlist_url):
+                self._set_error(
+                    "Playlist link must be a \"/playlist?list=...\" page, "
+                    "e.g. https://www.youtube.com/playlist?list=..."
+                )
+                return
+            playlist_quality = self.playlist_quality_combo.currentText()
+            playlist_numbering = self.playlist_numbering_checkbox.isChecked()
         elif ptype == "Sub Group":
             channels = []
             seen = set()
@@ -3722,6 +3831,8 @@ class _NewProfileDialog(QDialog):
 
         self.result_data = {
             "name": name, "type": ptype, "channel_url": channel_url, "channels": channels,
+            "playlist_url": playlist_url, "playlist_quality": playlist_quality,
+            "playlist_numbering": playlist_numbering,
         }
         self.accept()
 
@@ -3735,6 +3846,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.resize(1000, 600)
         self.setMinimumSize(1000, 600)
+
+        # Set first, before anything else in __init__ runs, since a handful of
+        # methods that could in principle be reached from UI construction check
+        # these (see _save_links_to_disk/_flush_links_autosave).
+        self._links_dirty = False
+        self._sidebar_info_dirty = False
 
         self._log_header = f"{APP_NAME} v{APP_VERSION} — UI ready"
         self._prev_url_text = ""
@@ -3838,6 +3955,17 @@ class MainWindow(QMainWindow):
         self._download_timeout_timer.setInterval(1000)
         self._download_timeout_timer.timeout.connect(self._on_download_timeout_tick)
 
+        # Set by _set_download_progress/set_download_speed instead of writing to
+        # disk or recomputing sidebar totals right away (both are whole-tree
+        # operations, too expensive to redo on the GUI thread on every single
+        # progress/speed tick a download reports) - _links_autosave_timer below
+        # picks them up at most once a second. See _flush_links_autosave.
+        # (Flags themselves are initialized at the very top of __init__.)
+        self._links_autosave_timer = QTimer(self)
+        self._links_autosave_timer.setInterval(1000)
+        self._links_autosave_timer.timeout.connect(self._flush_links_autosave)
+        self._links_autosave_timer.start()
+
         # Scheduler: the two "last triggered" day-keys stop a start/stop time from
         # firing more than once during the minute it matches.
         self._scheduler_last_start_day = None
@@ -3878,6 +4006,15 @@ class MainWindow(QMainWindow):
         self._start_ytdlp_update_check()
         self._start_ffmpeg_update_check()
         self._start_app_update_check()
+
+    # Flush any links-file save/sidebar-totals refresh that was deferred by a
+    # recent download progress/speed tick (see _set_download_progress/
+    # set_download_speed and _links_autosave_timer) before actually closing -
+    # otherwise up to ~1 second of the most recent progress could be lost from
+    # disk if the window closes right in between two autosave ticks.
+    def closeEvent(self, event):
+        self._flush_links_autosave()
+        super().closeEvent(event)
 
 
     # Assemble the main splitter layout (URL/settings panel, sidebar, log, button row)
@@ -4633,12 +4770,16 @@ class MainWindow(QMainWindow):
 
         self.about_donate_label = QLabel(
             "ytdlp-links is provided free of charge with source code "
-            "available under GPLv3 licence on github. If this program has been "
+            f'available under GPLv3 licence on <a href="github" style="color: {BORDER_FOCUS}; '
+            'text-decoration: underline;">github</a>. If this program has been '
             "useful to you in any way consider donating using one of the methods "
             "below:"
         )
         self.about_donate_label.setWordWrap(True)
         self.about_donate_label.setStyleSheet(sidebar_label_muted_style())
+        self.about_donate_label.setTextFormat(Qt.RichText)
+        self.about_donate_label.setTextInteractionFlags(Qt.LinksAccessibleByMouse)
+        self.about_donate_label.linkActivated.connect(self._on_about_donate_label_link_clicked)
         layout.addWidget(self.about_donate_label)
 
         self.about_donate_toggle_label = QLabel(
@@ -4681,9 +4822,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.about_version_label)
 
         # Tree-style status line under "app version: ..." - same pattern as the
-        # yt-dlp/ffmpeg ones below (see _start_app_update_check), except with no
-        # "click to update" link, since there's no in-place update mechanism for
-        # the app itself yet (see get_latest_app_version/APP_LATEST_RELEASE_URL).
+        # yt-dlp/ffmpeg ones below (see _start_app_update_check).
         app_update_row = QWidget()
         app_update_row_layout = QHBoxLayout(app_update_row)
         app_update_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -5012,9 +5151,10 @@ class MainWindow(QMainWindow):
                 f'<a href="update" style="color: {BORDER_FOCUS}; text-decoration: underline;">click to retry</a>'
             )
 
-    # Same idea as _start_ytdlp_update_check, but for the app's own version. There's
-    # no update task to trigger yet - see get_latest_app_version/APP_LATEST_RELEASE_URL,
-    # which will be filled in once the app has somewhere to publish releases to.
+    # Same idea as _start_ytdlp_update_check, but for the app's own version - see
+    # get_latest_app_version/APP_LATEST_RELEASE_URL. Runs automatically once at
+    # app startup (see __init__), every 6 hours after that (see
+    # _on_scheduler_tick), and again any time "click to retry" is used.
     def _start_app_update_check(self):
         self.about_app_update_text_label.setText("└── checking for updates…")
         self.about_app_update_link_label.setText("")
@@ -5022,25 +5162,46 @@ class MainWindow(QMainWindow):
         task.signals.finished.connect(self._on_app_update_check_finished)
         QThreadPool.globalInstance().start(task)
 
-    # Reports the result of _start_app_update_check back on the GUI thread
+    # Reports the result of _start_app_update_check back on the GUI thread.
+    # Release tags are dated ("2026.08.24", see APP_VERSION) rather than
+    # semver, so "newer" is a real chronological comparison via
+    # _parse_dated_app_version - NOT just "different from what's installed",
+    # since a published release can easily be older than what's currently
+    # running (e.g. a from-source checkout ahead of the last publish, or a tag
+    # that got re-cut backwards) and that shouldn't be reported as an update.
     def _on_app_update_check_finished(self, latest_version):
+        current_parsed = _parse_dated_app_version(APP_VERSION)
+        latest_parsed = _parse_dated_app_version(latest_version)
+
         if not latest_version:
             self.about_app_update_text_label.setText("└── could not check for updates")
             self.about_app_update_link_label.setText(
                 f'<a href="check" style="color: {BORDER_FOCUS}; text-decoration: underline;">click to retry</a>'
             )
-        elif latest_version == APP_VERSION:
+        elif latest_version == APP_VERSION or (
+            # Falls back to exact-match-only when either side doesn't parse as a
+            # date (so a malformed/unexpected tag is still handled sanely rather
+            # than crashing or silently mis-comparing), rather than assuming
+            # unparseable-but-different means "newer".
+            current_parsed is not None and latest_parsed is not None and latest_parsed <= current_parsed
+        ):
             self.about_app_update_text_label.setText("└── up to date")
             self.about_app_update_link_label.setText("")
         else:
+            # No in-app download/install anymore (see APP_RELEASES_PAGE_URL) -
+            # just point the user at the GitHub release page to grab it by hand.
             self.about_app_update_text_label.setText(f"└── new version available: {latest_version}")
-            self.about_app_update_link_label.setText("")
+            self.about_app_update_link_label.setText(
+                f'<a href="github" style="color: {BORDER_FOCUS}; text-decoration: underline;">visit github page</a>'
+            )
 
-    # Handles the "click to retry" link next to the app-version tree-style status
-    # line (there's no "update" link yet - see _on_app_update_check_finished)
+    # Handles both links that can appear next to the app-version tree-style status
+    # line, same as _on_ytdlp_update_link_clicked
     def _on_app_update_link_clicked(self, href):
         if href == "check":
             self._start_app_update_check()
+        elif href == "github":
+            QDesktopServices.openUrl(QUrl(APP_RELEASES_PAGE_URL))
 
     # Checked once per launch (see main()): this app no longer ships yt-dlp/ffmpeg
     # inside its own .exe (see _bundled_bin_dir), so a fresh install starts out
@@ -5134,6 +5295,13 @@ class MainWindow(QMainWindow):
         }.get(href)
         if url:
             QDesktopServices.openUrl(QUrl(url))
+
+    # Opens this app's own GitHub repo (the "github" link in the About tab's
+    # donate blurb - see _build_about_page) in the user's default browser, same
+    # pattern as _on_missing_binaries_link_clicked
+    def _on_about_donate_label_link_clicked(self, href):
+        if href == "github":
+            QDesktopServices.openUrl(QUrl(APP_REPO_URL))
 
     # Create a form label and register it in the settings search index
     def _settings_label(self, text, tab_index):
@@ -5791,18 +5959,25 @@ class MainWindow(QMainWindow):
 
     # For a Channel profile, the URL bar isn't used to add links (those come from
     # "Refresh" instead) - lock it read-only and show the channel's own link as
-    # placeholder/background text. A Sub Group profile works the same way, except
-    # there's no single link to show, so the placeholder mentions its channel count
-    # instead. Any other profile gets the normal, editable bar.
+    # placeholder/background text. A Playlist profile works the same way once it has
+    # a playlist link (set at creation time - see _NewProfileDialog._build_playlist_page)
+    # - its whole point is tracking that one playlist via Refresh, not accumulating
+    # further pasted links. A Sub Group profile is also locked, except there's no
+    # single link to show, so the placeholder mentions its channel count instead.
+    # Any other profile (including a Playlist profile from before this existed, with
+    # no playlist_url on file) gets the normal, editable bar.
     def _update_url_line_edit_for_profile(self):
         profile = self._current_profile_dict()
         ptype = profile.get("type") if profile else None
         channel_url = profile.get("channel_url") if profile and ptype == "Channel" else None
+        playlist_url = profile.get("playlist_url") if profile and ptype == "Playlist" else None
         is_subgroup = ptype == "Sub Group"
-        self.url_line_edit.setReadOnly(bool(channel_url) or is_subgroup)
+        self.url_line_edit.setReadOnly(bool(channel_url) or bool(playlist_url) or is_subgroup)
         if is_subgroup:
             count = len(profile.get("channels") or [])
             self._url_placeholder = f"{count} channel(s) — press Refresh to check for new uploads"
+        elif playlist_url:
+            self._url_placeholder = f"{playlist_url} — press Refresh to check for new videos"
         else:
             self._url_placeholder = (
                 f"{channel_url} — press Refresh to start appending links"
@@ -7113,10 +7288,36 @@ class MainWindow(QMainWindow):
         self._update_download_button()
         self._update_status_label()
 
-    # Update a link's persisted download percentage and refresh its displayed text
+    # Update a link's persisted download percentage and refresh its displayed text.
+    # Deliberately does NOT go through the full _renumber_url_list (whole-tree
+    # re-render + a synchronous save to disk) - that's fine at the rate other
+    # callers use it, but a download reports progress many times a second, and
+    # doing all of that on the GUI thread on every single tick (worse, once per
+    # *parallel* download) was the main source of UI stutter - scrolling, clicking
+    # into Settings, etc. - while downloads were running. Instead: redraw just
+    # this row right away (cheap), and defer the disk save to the once-a-second
+    # autosave flush (see _flush_links_autosave) so a burst of ticks across
+    # several downloads still costs at most one write per second, not dozens.
     def _set_download_progress(self, item, percent):
         item.setData(0, DOWNLOAD_PROGRESS_ROLE, percent)
-        self._renumber_url_list()
+        self._update_item_progress_display(item)
+        self._links_dirty = True
+
+    # Refresh just this one link's displayed text in place, without walking the
+    # rest of the tree - see _set_download_progress for why that matters. Reuses
+    # the "prefix" (number/status/decoration) _renumber_siblings last computed and
+    # cached on this item (see LINE_PREFIX_ROLE), since a progress tick never
+    # changes that part - only _display_text_with_progress's percentage. Falls
+    # back to a full renumber if this item somehow hasn't been numbered yet
+    # (nothing cached), which shouldn't normally happen since every item gets
+    # numbered as soon as it's added to the tree.
+    def _update_item_progress_display(self, item):
+        line_prefix = item.data(0, LINE_PREFIX_ROLE)
+        if line_prefix is None:
+            self._renumber_url_list()
+            return
+        raw = item.data(0, RAW_TEXT_ROLE)
+        item.setText(0, f"{line_prefix}{self._display_text_with_progress(item, raw)}")
 
     def _on_download_progress(self, item, percent):
         # A progress update means this attempt actually started transferring bytes,
@@ -7532,8 +7733,8 @@ class MainWindow(QMainWindow):
         self.duration_label.setVisible(False)
 
     # Context menu for right-clicking empty space in the tree (no link/folder under
-    # the cursor): just Search, plus Expand all folders (if the tree has any folder)
-    # and, for a Sub Group profile, Reset numbering.
+    # the cursor): Search, Show completed (every profile), plus Expand/Collapse all
+    # folders (if the tree has any) and, for a Sub Group profile, Reset numbering.
     def _show_url_list_background_menu(self, pos):
         menu = QMenu(self)
         menu.setStyleSheet(menu_style())
@@ -7546,9 +7747,8 @@ class MainWindow(QMainWindow):
             menu.addSeparator()
         profile = self._current_profile_dict()
         is_subgroup = bool(profile and profile.get("type") == "Sub Group")
-        is_channel_or_subgroup = bool(profile and profile.get("type") in ("Channel", "Sub Group"))
         act_reset_numbering = menu.addAction("Reset numbering") if is_subgroup else None
-        act_show_completed = menu.addAction("Show completed") if is_channel_or_subgroup else None
+        act_show_completed = menu.addAction("Show completed")
         menu.addSeparator()
         act_toggle_hide_skipped = menu.addAction(
             "Show skipped" if self._hide_skipped_links else "Hide skipped"
@@ -7562,7 +7762,7 @@ class MainWindow(QMainWindow):
             self._collapse_all_folders()
         elif act_reset_numbering is not None and action == act_reset_numbering:
             self._reset_subgroup_numbering()
-        elif act_show_completed is not None and action == act_show_completed:
+        elif action == act_show_completed:
             self._show_completed_links_dialog()
         elif action == act_toggle_hide_skipped:
             self._hide_skipped_links = not self._hide_skipped_links
@@ -7631,17 +7831,21 @@ class MainWindow(QMainWindow):
         self._renumber_url_list()
         self._log(f"Reset numbering: {count} completed link(s) will no longer be numbered")
 
-    # "Show completed" (Channel/Sub Group background context menu): lists every
+    # "Show completed" (background context menu, any profile): lists every
     # completed link in the profile, with an option to bulk-remove all of them
     # except whichever are the most recent - i.e. the tracking anchor(s) a future
     # "Refresh" treats as already-caught-up (see _most_recent_channel_link_ids) -
     # so cleaning up old completed downloads never accidentally removes the exact
-    # video(s) an upload check would otherwise re-add as "new".
+    # video(s) an upload check would otherwise re-add as "new". That tracking
+    # concept only exists for Channel/Sub Group profiles; for any other profile
+    # type _most_recent_channel_link_ids returns no anchors, so every completed
+    # link there is freely removable.
     def _show_completed_links_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("Completed links")
-        dialog.setMinimumWidth(420)
-        dialog.setMinimumHeight(320)
+        # 75% of the app's own default window size (see MainWindow.__init__'s
+        # resize(1000, 600)/setMinimumSize(1000, 600)), not an arbitrary figure.
+        dialog.setMinimumSize(750, 450)
         layout = QVBoxLayout(dialog)
 
         list_widget = QListWidget()
@@ -7655,8 +7859,10 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         btn_remove = QPushButton("Remove all except most recent")
         btn_remove.setStyleSheet(button_style())
+        btn_remove.setMinimumWidth(80)
         btn_close = QPushButton("Close")
         btn_close.setStyleSheet(button_style())
+        btn_close.setMinimumWidth(80)
         row.addWidget(btn_remove)
         row.addStretch()
         row.addWidget(btn_close)
@@ -8805,15 +9011,17 @@ class MainWindow(QMainWindow):
                 if child.data(0, FORCE_QUALITY_PENDING_ROLE):
                     prefix += "[Force Quality] "
                 if child.data(0, LINK_SKIPPED_ROLE):
-                    child.setText(0, f"{prefix}[Skip] - {self._display_text_with_progress(child, raw)}")
+                    line_prefix = f"{prefix}[Skip] - "
                 elif child.data(0, LINK_NUMBERING_RESET_ROLE):
-                    child.setText(0, f"{prefix}[Done] - {self._display_text_with_progress(child, raw)}")
+                    line_prefix = f"{prefix}[Done] - "
                 else:
                     display_number = (
                         order_map.get(id(child), number) if order_map is not None else number
                     )
-                    child.setText(0, f"{prefix}{display_number} - {self._display_text_with_progress(child, raw)}")
+                    line_prefix = f"{prefix}{display_number} - "
                     number += 1
+                child.setData(0, LINE_PREFIX_ROLE, line_prefix)
+                child.setText(0, f"{line_prefix}{self._display_text_with_progress(child, raw)}")
             if child.childCount():
                 self._renumber_siblings(child, order_map)
 
@@ -8878,7 +9086,22 @@ class MainWindow(QMainWindow):
     # Save the current URL/folder tree to disk so it can be restored on next launch
     def _save_links_to_disk(self):
         save_links_file({"items": self._serialize_children(None)})
+        self._links_dirty = False
+        self._sidebar_info_dirty = False
         self._update_sidebar_info()
+
+    # Once-a-second flush for the two things _set_download_progress/
+    # set_download_speed defer instead of doing immediately (see their comments
+    # and _links_autosave_timer's setup) - a pending links-file save (which also
+    # clears/covers a pending sidebar-totals refresh as a side effect) or, failing
+    # that, a pending sidebar-totals-only refresh for a speed change that arrived
+    # without any accompanying progress change.
+    def _flush_links_autosave(self):
+        if self._links_dirty:
+            self._save_links_to_disk()
+        elif self._sidebar_info_dirty:
+            self._sidebar_info_dirty = False
+            self._update_sidebar_info()
 
     # Recursively yield every link item (not folders) in the tree, or under the
     # given parent folder item if one is passed
@@ -8938,14 +9161,20 @@ class MainWindow(QMainWindow):
             else sidebar_label_inactive_style()
         )
 
-    # Record (or clear, if kbps is falsy) a link's live download speed in KB/s and
-    # refresh the sidebar total; called by the download worker as transfers progress
+    # Record (or clear, if kbps is falsy) a link's live download speed in KB/s.
+    # Doesn't refresh the sidebar total immediately - like _set_download_progress,
+    # this is called many times a second per active download, and
+    # _update_sidebar_info walks the whole tree to recompute its totals, so doing
+    # that on every single speed tick was contributing to the same GUI-thread
+    # stutter during downloads. Just marks it dirty; the once-a-second autosave
+    # flush (see _flush_links_autosave) picks it up from there, same as a pending
+    # links-file save.
     def set_download_speed(self, link_uuid, kbps):
         if kbps:
             self._download_speeds_kbps[link_uuid] = kbps
         else:
             self._download_speeds_kbps.pop(link_uuid, None)
-        self._update_sidebar_info()
+        self._sidebar_info_dirty = True
 
     # Rebuild one tree item (and its children, if a folder) from a saved dict;
     # returns None for malformed entries so a corrupt file can't crash startup
@@ -9619,9 +9848,10 @@ class MainWindow(QMainWindow):
             self._reload_profile_list()
 
     # "New..." button: single dialog collects name, type, and whatever extra
-    # options that type needs (channel link for Channel, a dynamic list of
-    # channel name+link rows for Sub Group, nothing for the rest) all in one
-    # window, then creates and switches to the resulting profile.
+    # options that type needs (channel link for Channel; playlist link, quality,
+    # and numbering for Playlist; a dynamic list of channel name+link rows for Sub
+    # Group; nothing for the rest) all in one window, then creates and switches to
+    # the resulting profile.
     def _on_new_profile_clicked(self):
         existing_names = [p["name"] for p in self._profiles]
         dialog = _NewProfileDialog(self, existing_names, self.quality_combo.currentText())
@@ -9633,18 +9863,33 @@ class MainWindow(QMainWindow):
         ptype = data["type"]
         channel_url = data["channel_url"]
         channels = data["channels"]
+        playlist_url = data["playlist_url"]
 
         self._profiles.append({
             "name": name, "type": ptype, "channel_url": channel_url, "channels": channels,
-            "number_by_upload_order": False,
+            "number_by_upload_order": False, "playlist_url": playlist_url,
         })
-        save_profile_metadata(name, ptype, channel_url, channels)
+        save_profile_metadata(name, ptype, channel_url, channels, playlist_url=playlist_url)
         self.profile_combo.blockSignals(True)
         self.profile_combo.addItem(name)
         self.profile_combo.blockSignals(False)
         self._reload_profile_list()
         self._log(f"Created profile '{name}' ({ptype})")
+        # Switching profiles (below) runs synchronously, so by the time this
+        # returns the new profile is already active with its baseline settings
+        # loaded/saved - only then is there anything to override or add a link to.
         self.profile_combo.setCurrentText(name)
+
+        if ptype == "Playlist" and playlist_url:
+            # The quality/numbering choices made in the dialog apply to this
+            # profile's own settings (not its profile.json metadata) - override
+            # the baseline the switch just loaded and persist it, same as if the
+            # user had changed those settings by hand right after creating it.
+            self.settings_committed["quality"] = data["playlist_quality"]
+            self.settings_committed["number_playlist_downloads"] = data["playlist_numbering"]
+            self._restore_settings(self.settings_committed)
+            save_settings_file(self.settings_committed)
+            self._add_urls_from_text(playlist_url)
 
     # "Delete" button: delete whichever profile is selected in the list (or the
     # active one if none is selected)

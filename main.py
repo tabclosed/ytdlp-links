@@ -1003,7 +1003,7 @@ MEMBERS_ONLY_ERROR_HINT = "member"
 
 
 APP_NAME = "ytdlp-links"
-APP_VERSION = "2026.09.09"
+APP_VERSION = "2026.09.14"
 
 # API endpoint this app's own releases are checked against, mirroring
 # _YTDLP_LATEST_RELEASE_URL/_FFMPEG_LATEST_RELEASE_URL below. Release tags on this
@@ -1111,7 +1111,7 @@ def _parse_dated_app_version(version):
 
 
 # Name of the local socket used to detect an already-running instance of the app -
-# see _try_activate_running_instance/_listen_for_other_instances/main. Just needs
+# see _try_activate_running_instance/_claim_single_instance_lock/main. Just needs
 # to be unique to this app, not anything user-facing.
 SINGLE_INSTANCE_KEY = f"{APP_NAME}-single-instance-lock"
 # How long to wait for an already-running instance to answer before assuming
@@ -1120,13 +1120,57 @@ SINGLE_INSTANCE_KEY = f"{APP_NAME}-single-instance-lock"
 SINGLE_INSTANCE_CONNECT_TIMEOUT_MS = 500
 
 
+# Claims a genuinely OS-atomic single-instance lock - a Windows named mutex, or
+# an flock() on Unix - which is what actually closes the last sliver of the
+# race _claim_single_instance_lock (below) can't: that one needs a QApplication
+# to already exist before it can do anything (QLocalServer is built on Qt's
+# event loop), so two processes launched close enough together (e.g. mashing
+# Enter on a terminal prompt) can both still be busy *constructing*
+# QApplication when the other one starts, before either has reached the point
+# of claiming anything. This has no such requirement - it's a single syscall,
+# available before QApplication, before even importing PySide6's Qt bindings
+# get initialized, so it's called as the literal first thing in main().
+#
+# Unlike a naive "does a lock/PID file exist" check, there's no separate
+# staleness problem to handle: both a flock and a named mutex are held by the
+# OS for exactly as long as the owning process is alive, and are released
+# automatically - by the kernel itself - the instant that process exits, even
+# on a crash or a kill -9. There's no path where a dead process's stale lock
+# blocks every future launch, so no cleanup logic is needed here at all.
+#
+# Returns an opaque handle to keep referenced (as a local in main(), so it
+# stays alive for the process's whole lifetime purely by still being on the
+# stack inside app.exec()) for as long as the app runs - dropping/closing it
+# releases the lock - or None if another instance already holds it.
+def _acquire_os_instance_lock():
+    if sys.platform == "win32":
+        import ctypes
+        ERROR_ALREADY_EXISTS = 183
+        handle = ctypes.windll.kernel32.CreateMutexW(
+            None, True, f"Global\\{SINGLE_INSTANCE_KEY}"
+        )
+        if not handle or ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            return None
+        return handle
+
+    import fcntl
+    lock_path = _app_dir() / ".instance.lock"
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    return fd
+
+
 # Try to reach an already-running instance of the app via its local socket
 # (SINGLE_INSTANCE_KEY). If one answers, ask it to raise/focus its window (see
-# _listen_for_other_instances) and return True so main() can exit instead of
-# opening a second instance. Returns False if nothing answers - either no other
-# instance is running, or a stale socket was left behind by one that crashed
-# (see QLocalServer.removeServer in _listen_for_other_instances, which cleans
-# that up for the *next* instance to actually start listening).
+# _wire_instance_server) and return True so main() can exit instead of opening
+# a second instance. Returns False if nothing answers.
 def _try_activate_running_instance():
     socket = QLocalSocket()
     socket.connectToServer(SINGLE_INSTANCE_KEY)
@@ -1138,18 +1182,42 @@ def _try_activate_running_instance():
     return True
 
 
-# Start listening on this instance's local socket so a later launch of the app can
-# detect us (_try_activate_running_instance) and ask us to raise/focus our window
-# instead of opening a second instance alongside us. Removes any stale socket left
-# behind by a previous crash before listening (QLocalServer.listen() otherwise
-# fails if one is already on disk - Unix-only; Windows named pipes don't have this
-# issue, so removeServer() is a harmless no-op there). Returns the QLocalServer,
-# which the caller must keep a live reference to for as long as the app runs.
-def _listen_for_other_instances(window):
+# Starts listening on this app's local socket (SINGLE_INSTANCE_KEY) so a later
+# launch of the app - one that loses the race for _acquire_os_instance_lock,
+# which is what actually decides exclusivity now - can reach this instance and
+# ask it to raise/focus its window (see _wire_instance_server) instead of
+# opening a second one of its own. Called right after QApplication exists (this
+# needs Qt's event loop; the OS-level lock doesn't), and expected to always
+# succeed at this point, since holding the OS-level lock already guarantees
+# nothing else could be bound to this name.
+#
+# Removes any stale socket left behind by a previous crash before listening
+# (Unix-only quirk - QLocalServer.listen() otherwise fails if one is already on
+# disk; Windows named pipes don't have this issue, so removeServer() is a
+# harmless no-op there).
+#
+# Returns the QLocalServer on success (caller must keep a live reference to it
+# for as long as the app runs, and later pass it to _wire_instance_server once
+# the window it should raise/focus exists), or None on the rare failure this
+# isn't expected to hit in practice - the caller should degrade gracefully
+# (start the app without that IPC capability) rather than treat this as
+# another instance actually being detected; that determination was already
+# made by _acquire_os_instance_lock.
+def _claim_single_instance_lock():
     QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
     server = QLocalServer()
-    server.listen(SINGLE_INSTANCE_KEY)
+    if not server.listen(SINGLE_INSTANCE_KEY):
+        return None
+    return server
 
+
+# Wires up an already-claimed single-instance server (see
+# _claim_single_instance_lock) so a later launch of the app connecting to it
+# raises/focuses window instead of opening a second instance alongside it.
+# Split out from claiming the lock itself since that has to happen before
+# window exists (see main) - nothing here is time-sensitive/racy, unlike the
+# claim, so there's no reason it can't wait until after the window is built.
+def _wire_instance_server(server, window):
     # Another instance is asking us to take over - raise and focus our window
     def _on_new_connection():
         socket = server.nextPendingConnection()
@@ -1161,7 +1229,6 @@ def _listen_for_other_instances(window):
         window.activateWindow()
 
     server.newConnection.connect(_on_new_connection)
-    return server
 
 
 # Settings and saved-links files live inside the active profile's folder
@@ -10048,6 +10115,24 @@ class MainWindow(QMainWindow):
 
 # Application entry point: configure the Qt app and show the main window
 def main():
+    # Claimed before anything else - literally the first thing this function
+    # does, before even the Windows AUMID call below, let alone QApplication -
+    # see _acquire_os_instance_lock for why. os_lock is a plain local variable
+    # deliberately: as long as it's still referenced somewhere on the stack (it
+    # is, for as long as main() hasn't returned - app.exec() below blocks right
+    # here for the app's whole lifetime), the lock stays held. No need to do
+    # anything else to keep it alive, and nothing later in this function should
+    # ever reassign or drop it.
+    os_lock = _acquire_os_instance_lock()
+    if os_lock is None:
+        # Someone else already holds the OS-level lock - just need a bare
+        # QApplication to talk to them over the local socket (see
+        # _try_activate_running_instance) and ask them to raise/focus their
+        # window, then quit immediately without building anything further.
+        app = QApplication(sys.argv)
+        _try_activate_running_instance()
+        return
+
     # On Windows, the taskbar icon (unlike the title-bar icon) isn't taken from
     # QApplication.setWindowIcon() - it's taken from the process's AppUserModelID
     # (AUMID), which groups windows in the taskbar. Without setting one explicitly,
@@ -10064,11 +10149,14 @@ def main():
         except Exception:
             pass
     app = QApplication(sys.argv)
-    # Only one instance of the app should ever run at once - if another is already
-    # running, hand off to it (raising/focusing its window) and quit immediately
-    # rather than opening a second one alongside it.
-    if _try_activate_running_instance():
-        return
+    # Also claim the QLocalServer side of things, purely for the "raise/focus
+    # my window" IPC a *later* launch will use once it loses the OS-level lock
+    # above - not for exclusivity itself, since holding os_lock already
+    # guarantees that. Expected to always succeed at this point (nothing else
+    # could be holding this name if we're the only instance), but degrades
+    # gracefully - just without that IPC capability - if it somehow doesn't,
+    # rather than failing to start the app over it.
+    instance_server = _claim_single_instance_lock()
     app.setStyle("Fusion")
     app.setEffectEnabled(Qt.UIEffect.UI_AnimateCombo, False)
     # Makes sure this app's persistent ytdlp-bin folder exists so the startup
@@ -10101,8 +10189,14 @@ def main():
     if icon_path.is_file() and not icon.isNull():
         win.setWindowIcon(icon)
     # Kept alive for as long as the window is (i.e. the app's whole lifetime) so
-    # the socket keeps listening - see _listen_for_other_instances.
-    win._instance_server = _listen_for_other_instances(win)
+    # the socket keeps listening - see _claim_single_instance_lock. Only wired up
+    # if the claim actually succeeded above; in the fallback case where it didn't
+    # and nothing answered either, this run just isn't discoverable by a later
+    # launch (see the comment where instance_server is set) rather than crashing
+    # on a None server here.
+    win._instance_server = instance_server
+    if instance_server is not None:
+        _wire_instance_server(instance_server, win)
     win.show()
     # See _force_windows_taskbar_icon's docstring/comment: this fixes the
     # taskbar button showing a generic icon on first launch, which the

@@ -11,6 +11,7 @@ Some features are:
 * probing links would rename them, collect info such as size, runtime, thumbnail and ...
 * everything is stored in simple json, can be browsed, or backed up as easy as copying somewhere else
 * no install required, portable, everything self-contained in it's own directory.
+* censorship resistant (see # censored regions - low quality connections)
 <br>
 <p align="center">
   <img src="sample-image.png" width="700">
@@ -49,11 +50,21 @@ Second: Robust retry logic. When a bad connection will usually cause a failed do
 
 # support
 
-This project is the result of years using various downloaders and imagining a wishlist of functionalities. If this program happens to be helpful to you please consider donating using one of the methods below. It encourages development for more free useful programs.
+This project is the result of years using various downloaders and imagining a wishlist of functionalities. If this program happens to be helpful to you please consider a [donation](https://github.com/tabclosed/tabclosed).
+
+# executables 
+
+The releases are for windows, linux and arm (like raspberry pie). Linux versions are untested (for now) but it should work. 
+
+As this is a python project, it can be packaged by pyinstaller with --onedir or --onefile. Releases of both are available, the difference is the directory version launches (slightly) faster while being around 60mb larger compared to the single file compressed version.
+
+# build it yourself
+
+Download the project, then open a powershell in that folder. You can build it for windows using this command. You need to have pip and pyinstaller installed.
+```powershell
+pyinstaller --onefile --windowed --icon=icon.ico --name=ytdlp-links --add-data "icon.png;." --add-data "icon.ico;." main.py
+```
 
 
-   Bitcoin&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; : bc1q8vwyhuxjwnlnp65n8n6x47gsud5mngar6a3avx<br>
-   Ethereum&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; : 0x412eeD82a0F251a81eB69Dff951f0659Db9A5081<br>
-   USDT (ERC20)&nbsp;&nbsp; : 0x412eeD82a0F251a81eB69Dff951f0659Db9A5081<br>
-   TON&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; : UQBDtAn1OFbrRWe5SetkkKFBXCvGoBorUyTrsOVHUwrf8Qi1
+
 

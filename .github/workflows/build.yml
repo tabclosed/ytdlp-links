@@ -1,0 +1,218 @@
+name: Build executables
+
+# Manual only ("Run workflow" in the Actions tab) - prompts for a tag name via
+# the "tag" input below, builds, then creates that tag and a GitHub Release
+# together, with both executables attached (see the release job). Nothing
+# runs automatically on push - if that build-sanity-check-on-every-push
+# behavior is wanted back later, add a `push: branches: [main]` trigger
+# alongside workflow_dispatch below (the release job already only runs for a
+# manual dispatch either way, via its own `if:`, so that alone wouldn't
+# start creating releases on every push).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create and release (e.g. 2026.08.27)"
+        required: true
+      description:
+        description: "Release description/notes"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    strategy:
+      # One platform failing to build (e.g. a Windows-only import breaking on
+      # Linux) doesn't cancel the other - each still finishes and uploads
+      # whatever it produced.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - os: windows-latest
+            artifact_name: dist/ytdlp-links.exe
+            asset_name: ytdlp-links-windows.exe
+          - os: ubuntu-latest
+            artifact_name: dist/ytdlp-links
+            asset_name: ytdlp-links-linux
+            onedir_tar_name: ytdlp-links-linux-onedir.tar.gz
+          - os: ubuntu-24.04-arm
+            artifact_name: dist/ytdlp-links
+            asset_name: ytdlp-links-linux-arm64
+            onedir_tar_name: ytdlp-links-linux-arm64-onedir.tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # PySide6's import machinery pulls in some system GL/XCB libraries that
+      # PyInstaller's analysis step needs available at *build* time (not just
+      # runtime) to introspect the app - a handful of them aren't on the
+      # default Ubuntu runner image, so builds fail here without this.
+      # Windows/macOS runners already have everything PySide6 needs.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xinerama0
+
+      - name: Install Python dependencies
+        run: pip install PySide6 pyinstaller
+
+      # Same command on every OS - see ytdlp-links.spec's own comment for why a
+      # spec file avoids needing OS-specific flags here. Produces the single
+      # "one file, everything embedded" .exe/binary.
+      - name: Build with PyInstaller (onefile)
+        run: pyinstaller ytdlp-links.spec
+
+      # Windows and Linux (both x86_64 and arm64) also get a second build
+      # variant: --onedir instead of --onefile, i.e. the executable plus its
+      # dependencies as a folder of loose files rather than one
+      # self-extracting file. Some people prefer this - it starts faster (no
+      # self-extraction step on every launch) at the cost of being a folder
+      # instead of a single file. Built via raw CLI flags rather than through
+      # ytdlp-links.spec, into its own --distpath/--workpath so it can't
+      # collide with the onefile build's intermediate files above (both use
+      # --name=ytdlp-links, and PyInstaller's default build/dist folders are
+      # shared across invocations unless told otherwise).
+      - name: Build with PyInstaller (onedir, Windows only)
+        if: runner.os == 'Windows'
+        run: >
+          pyinstaller --onedir --windowed --icon=icon.ico --name=ytdlp-links
+          --add-data "icon.png;." --add-data "icon.ico;."
+          --distpath dist-onedir --workpath build-onedir main.py
+
+      # Same idea as the Windows onedir build above, just with ":" as the
+      # --add-data separator instead of ";" (Linux/macOS vs Windows syntax -
+      # see main.spec's comment for why the onefile build sidesteps this via
+      # a spec file instead). No --icon/icon.ico here since that file is
+      # Windows-only, same reasoning as main.spec.
+      - name: Build with PyInstaller (onedir, Linux only)
+        if: runner.os == 'Linux'
+        run: >
+          pyinstaller --onedir --windowed --name=ytdlp-links
+          --add-data "icon.png:."
+          --distpath dist-onedir --workpath build-onedir main.py
+
+      # actions/upload-artifact can upload a whole folder directly, but a
+      # user downloading a "onedir" build expects one archive they can
+      # extract - not a raw folder structure sitting inside GitHub's own
+      # artifact zip wrapper (which would mean a zip inside a zip).
+      - name: Zip onedir build (Windows only)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist-onedir/ytdlp-links -DestinationPath ytdlp-links-windows-onedir.zip
+
+      # tar.gz rather than zip on Linux, to preserve the executable bit on
+      # the binary inside (zip doesn't reliably store unix file permissions,
+      # so ytdlp-links would come out non-executable after extraction).
+      # Filename comes from the matrix (onedir_tar_name) rather than being
+      # hardcoded, since the x86_64 and arm64 Linux runners both hit this
+      # step and would otherwise produce identically-named files, which
+      # upload-artifact below can't tell apart within the same run.
+      - name: Tar onedir build (Linux only)
+        if: runner.os == 'Linux'
+        run: tar -czf ${{ matrix.onedir_tar_name }} -C dist-onedir ytdlp-links
+
+      - name: Upload onefile build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.artifact_name }}
+
+      - name: Upload onedir build artifact (Windows only)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ytdlp-links-windows-onedir.zip
+          path: ytdlp-links-windows-onedir.zip
+
+      - name: Upload onedir build artifact (Linux only)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.onedir_tar_name }}
+          path: ${{ matrix.onedir_tar_name }}
+
+  # Only runs for a manual "Run workflow" trigger (never for a plain push to
+  # main). Uses the GitHub CLI (preinstalled on every GitHub-hosted runner)
+  # rather than a third-party action, specifically for its "file#Label" upload
+  # syntax below - that's what lets each asset show a friendly "Windows"/
+  # "Linux" label in the release page's UI without that text becoming part of
+  # the actual downloaded filename (which a plain uploaded-file-list approach
+  # can't do: the filename *is* the only name it has).
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # The default GITHUB_TOKEN is read-only on some repos' settings - this is
+    # what actually grants permission to create the tag/release below.
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # Each build was uploaded as a CI artifact under a descriptive name
+      # (ytdlp-links-windows.exe, etc. - useful for browsing this run's own
+      # Artifacts list) but that's not what should show up as the actual
+      # release download filename. Collect all six here, in one place, rather
+      # than baking "-windows"/"-onedir" into the release asset names
+      # themselves.
+      - name: Collect assets under their release filenames
+        run: |
+          mkdir release-assets
+          cp artifacts/ytdlp-links-windows.exe/ytdlp-links.exe release-assets/ytdlp-links-windows.exe
+          cp artifacts/ytdlp-links-linux/ytdlp-links release-assets/ytdlp-links-linux
+          cp artifacts/ytdlp-links-linux-arm64/ytdlp-links release-assets/ytdlp-links-arm
+          cp artifacts/ytdlp-links-windows-onedir.zip/ytdlp-links-windows-onedir.zip release-assets/ytdlp-links-windows.zip
+          cp artifacts/ytdlp-links-linux-onedir.tar.gz/ytdlp-links-linux-onedir.tar.gz release-assets/ytdlp-links-linux.tar.gz
+          cp artifacts/ytdlp-links-linux-arm64-onedir.tar.gz/ytdlp-links-linux-arm64-onedir.tar.gz release-assets/ytdlp-links-arm.tar.gz
+
+      # --target pins the new tag to the exact commit this run built, rather
+      # than whatever the default branch's tip happens to be by the time this
+      # step runs. The "#Label" suffix on each file sets that asset's display
+      # label (shown instead of the filename on the release page) without
+      # touching the filename itself - so the release page can show the full
+      # "Windows (onefile)" / "Windows (onedir, zipped)" / etc description,
+      # while what actually downloads stays minimal: ytdlp-links-windows.exe /
+      # ytdlp-links-windows.zip / ytdlp-links-linux / ytdlp-links-linux.tar.gz /
+      # ytdlp-links-arm / ytdlp-links-arm.tar.gz.
+      #
+      # Note the "tag" and "description" inputs are plain single-line text
+      # boxes in the "Run workflow" form (GitHub doesn't offer a multi-line
+      # textarea for workflow_dispatch inputs) - fine for a one-line summary,
+      # but not the place for real multi-paragraph release notes. Edit the
+      # release afterwards on GitHub itself if you want more than that.
+      #
+      # Both inputs are free text someone typed into that form, so they're
+      # passed through env vars ($RELEASE_TAG/$RELEASE_NOTES) rather than
+      # interpolated straight into this script via ${{ }} - a stray quote or
+      # backtick typed into either would otherwise land in the shell command
+      # as literal script text, not just data.
+      - name: Create release and upload assets
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag }}
+          RELEASE_NOTES: ${{ github.event.inputs.description }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "$RELEASE_TAG" \
+            --notes "$RELEASE_NOTES" \
+            "release-assets/ytdlp-links-windows.exe#Windows (onefile) - ytdlp-links-windows.exe" \
+            "release-assets/ytdlp-links-windows.zip#Windows (onedir, zipped) - ytdlp-links-windows.zip" \
+            "release-assets/ytdlp-links-linux#Linux x86_64 (onefile) - ytdlp-links-linux" \
+            "release-assets/ytdlp-links-linux.tar.gz#Linux x86_64 (onedir, tarred) - ytdlp-links-linux.tar.gz" \
+            "release-assets/ytdlp-links-arm#Linux ARM64 (onefile) - ytdlp-links-arm" \
+            "release-assets/ytdlp-links-arm.tar.gz#Linux ARM64 (onedir, tarred) - ytdlp-links-arm.tar.gz"

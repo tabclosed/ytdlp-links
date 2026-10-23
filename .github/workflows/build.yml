@@ -72,7 +72,11 @@ jobs:
             libxcb-render-util0 libxcb-shape0 libxcb-xinerama0
 
       - name: Install Python dependencies
-        run: pip install PySide6 pyinstaller
+        # PySide6 is pinned on purpose: 6.12.0 renders every QSpinBox/QTimeEdit
+        # styled via setStyleSheet() as blank/non-editable (proxy port, retry
+        # counts, scheduler times...). 6.8 through 6.11.2 are fine. Bump this
+        # only after checking spin boxes still render in the built app.
+        run: pip install "PySide6==6.11.2" pyinstaller
 
       # Same command on every OS - see ytdlp-links.spec's own comment for why a
       # spec file avoids needing OS-specific flags here. Produces the single

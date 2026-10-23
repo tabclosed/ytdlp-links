@@ -54,7 +54,7 @@ This project is the result of years using various downloaders and imagining a wi
 
 # executables 
 
-The releases are for windows, linux and arm (like raspberry pie). Linux versions are untested (for now) but it should work. 
+The releases are for windows, linux and arm (like raspberry pie). Linux versions are untested (for now) but they should work. 
 
 As this is a python project, it can be packaged by pyinstaller with --onedir or --onefile. Releases of both are available, the difference is the directory version launches (slightly) faster while being around 60mb larger compared to the single file compressed version.
 

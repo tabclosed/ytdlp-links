@@ -28,12 +28,15 @@
         │       └── log (QTextEdit)
         └── button_row
 """
+import hashlib
+import html
 import json
 import math
 import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -44,10 +47,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import http.client
+import ipaddress
+import socket as _socket
 import ssl
+import struct
 import uuid
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from PySide6.QtCore import (
     QEvent, QObject, QPoint, QPointF, QRegularExpression, QRunnable, QSize, Qt,
@@ -171,6 +177,22 @@ def _app_temp_dir():
     return path
 
 
+# Directory the rendered QSS icons are cached in: next to the executable (see
+# _app_temp_dir) when that's writable, else a folder under the system temp dir, else
+# None. An unwritable app folder (Program Files, a read-only drive) used to make the
+# unguarded mkdir() calls below raise during startup, killing a windowed build before
+# any window showed; a missing icon cache only costs the cosmetic arrow glyphs.
+def _icon_cache_dir():
+    for base in (_app_temp_dir(), Path(tempfile.gettempdir()) / APP_NAME):
+        path = base / "ui_template_icons_v2"
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return None
+
+
 def _blank_icon_path(size=9):
     # Fully transparent canvas, cached once per size and shared by every
     # direction - used as the scrollbar arrows' resting-state image so
@@ -178,8 +200,9 @@ def _blank_icon_path(size=9):
     # (square) or (width, height) tuple, matching the real subcontrol box
     # so Qt has nothing to stretch even though it's blank either way.
     w, h = (size, size) if isinstance(size, int) else size
-    cache_dir = _app_temp_dir() / "ui_template_icons_v2"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = _icon_cache_dir()
+    if cache_dir is None:
+        return ""
     icon_path = cache_dir / f"blank_{w}x{h}.png"
     if not icon_path.exists():
         pixmap = QPixmap(w, h)
@@ -199,8 +222,9 @@ def _triangle_icon_path(cache_name, color, direction, glyph_size=9, canvas_size=
     # glyph_size x glyph_size square for callers (like the combo box
     # down-arrow) that don't need the extra canvas room.
     canvas_w, canvas_h = canvas_size or (glyph_size, glyph_size)
-    cache_dir = _app_temp_dir() / "ui_template_icons_v2"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = _icon_cache_dir()
+    if cache_dir is None:
+        return ""
     bg_suffix = f"_bg{bg_color.lstrip('#')}" if bg_color else ""
     icon_path = (
         cache_dir
@@ -238,16 +262,15 @@ def _triangle_icon_path(cache_name, color, direction, glyph_size=9, canvas_size=
 # left over from a previous run.
 _ICON_ASSET_VERSION = 4
 
-_ICON_CACHE_DIR = _app_temp_dir() / "ui_template_icons_v2"
-
-
 # Render (and cache on disk) a small flat glyph icon in the given color, for use
 # as a QPushButton's setIcon(). `kind` selects the glyph; size is the square
 # canvas in px. Used by the bottom action row (Settings/Probe/Download/
 # Refresh/Minimize Log/Exit) so each button gets both a colored icon and label.
 def _flat_icon_path(kind, color, size=16):
-    _ICON_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    icon_path = _ICON_CACHE_DIR / f"flat_{kind}_{size}_v{_ICON_ASSET_VERSION}_{color.lstrip('#')}.png"
+    cache_dir = _icon_cache_dir()
+    if cache_dir is None:
+        return ""
+    icon_path = cache_dir / f"flat_{kind}_{size}_v{_ICON_ASSET_VERSION}_{color.lstrip('#')}.png"
     if icon_path.exists():
         return icon_path.as_posix()
 
@@ -899,6 +922,12 @@ VIDEO_FILE_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".wmv", ".m4v",
     ".mpg", ".mpeg", ".ts", ".3gp",
 }
+# Audio files this app can produce (e.g. "Audio only as mp3", or a non-YouTube site whose
+# best audio is .m4a/.opus). Allowlisted for double-click-to-open for the same reason as
+# video above: only known media types are ever handed to the OS, never e.g. an .exe.
+AUDIO_FILE_EXTENSIONS = {
+    ".mp3", ".m4a", ".opus", ".ogg", ".oga", ".flac", ".wav", ".aac",
+}
 # A link's fixed 1-based position in the playlist it was expanded from (the order
 # yt-dlp reported, i.e. the uploader's order) - set once when the playlist folder is
 # created and never touched again, so re-sorting the folder in the tree doesn't
@@ -1003,7 +1032,7 @@ MEMBERS_ONLY_ERROR_HINT = "member"
 
 
 APP_NAME = "ytdlp-links"
-APP_VERSION = "2026.09.14"
+APP_VERSION = "2026.10.23"
 
 # API endpoint this app's own releases are checked against, mirroring
 # _YTDLP_LATEST_RELEASE_URL/_FFMPEG_LATEST_RELEASE_URL below. Release tags on this
@@ -1020,48 +1049,149 @@ APP_RELEASES_PAGE_URL = "https://github.com/tabclosed/ytdlp-links/releases/lates
 APP_REPO_URL = "https://github.com/tabclosed/ytdlp-links"
 
 
+# What MainWindow._current_proxy() hands back when the proxy switch is ON but the host
+# can't be used (blank, or not a valid IP). It exists so that case fails CLOSED: returning
+# None would mean "no proxy", and every request would silently go out directly - the
+# opposite of what someone who turned the proxy on asked for. _build_proxy_opener and
+# _ytdlp_proxy_arg both refuse it with PROXY_BLOCKED_MESSAGE, so nothing connects until
+# the setting is fixed or the proxy is switched off.
+PROXY_BLOCKED = "blocked://proxy-misconfigured"
+PROXY_BLOCKED_MESSAGE = (
+    "Proxy is turned on but no valid proxy host is set - refusing to connect directly. "
+    "Fix it in Connection settings, or turn the proxy off."
+)
+
+_SOCKS5_REPLY_ERRORS = {
+    1: "general SOCKS server failure", 2: "connection not allowed by ruleset",
+    3: "network unreachable", 4: "host unreachable", 5: "connection refused",
+    6: "TTL expired", 7: "command not supported", 8: "address type not supported",
+}
+
+
+# Read exactly n bytes from sock, or raise OSError if the peer hangs up first
+def _socks5_read_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise OSError("SOCKS5 proxy closed the connection unexpectedly")
+        data += chunk
+    return data
+
+
+# Open a TCP connection to dest_host:dest_port *through* a SOCKS5 proxy (no-auth CONNECT,
+# RFC 1928) and return the connected socket. Hostnames are sent to the proxy as names, not
+# resolved here, so DNS happens on the proxy's side too (same as yt-dlp's "socks5h").
+# Built in on purpose: it used to need the third-party PySocks package, which yt-dlp does
+# NOT need (it has its own SOCKS client) - so with a SOCKS5 proxy, probes and downloads
+# worked while this app's own requests (thumbnails, update checks) failed on any install
+# that didn't happen to have PySocks. Raises OSError on any failure.
+def _socks5_connect(proxy_host, proxy_port, dest_host, dest_port, timeout=None):
+    sock = _socket.create_connection((proxy_host, proxy_port), timeout=timeout)
+    try:
+        sock.sendall(b"\x05\x01\x00")  # version 5, one method offered: "no authentication"
+        try:
+            version, method = _socks5_read_exact(sock, 2)
+        except TimeoutError:
+            raise OSError("the proxy never answered the SOCKS5 handshake - is it really a "
+                          "SOCKS5 proxy? (check the protocol setting)") from None
+        if version != 5:
+            raise OSError("the proxy didn't answer like a SOCKS5 server (wrong protocol selected?)")
+        if method != 0:
+            raise OSError("SOCKS5 proxy requires authentication, which isn't supported")
+        try:
+            ip = ipaddress.ip_address(dest_host)
+        except ValueError:
+            name = dest_host.encode("idna")
+            if not 0 < len(name) <= 255:
+                raise OSError(f"invalid host name for SOCKS5: {dest_host!r}")
+            address = b"\x03" + bytes([len(name)]) + name
+        else:
+            address = (b"\x01" if ip.version == 4 else b"\x04") + ip.packed
+        sock.sendall(b"\x05\x01\x00" + address + struct.pack(">H", dest_port))
+        try:
+            _version, reply, _reserved, address_type = _socks5_read_exact(sock, 4)
+        except TimeoutError:
+            raise OSError(f"SOCKS5 proxy timed out connecting to {dest_host}:{dest_port}") from None
+        if reply != 0:
+            reason = _SOCKS5_REPLY_ERRORS.get(reply, f"error code {reply}")
+            raise OSError(f"SOCKS5 proxy could not reach {dest_host}:{dest_port}: {reason}")
+        if address_type == 1:
+            skip = 4
+        elif address_type == 4:
+            skip = 16
+        elif address_type == 3:
+            skip = _socks5_read_exact(sock, 1)[0]
+        else:
+            raise OSError("malformed SOCKS5 reply")
+        _socks5_read_exact(sock, skip + 2)  # bound address + port, unused
+        return sock
+    except BaseException:
+        sock.close()
+        raise
+
+
+# urllib's ProxyHandler, minus its proxy_bypass() check. The stock one consults NO_PROXY
+# and (on Windows) the system "ProxyOverride" list even when handed an explicit proxy, and
+# sends any matching host straight out - so with this app's proxy switched on, requests
+# to e.g. "localhost", a "<local>" name or a corporate domain would silently skip it.
+# Otherwise identical to the stdlib's handling (no credentials: the UI has no fields for them).
+class _ForcedProxyHandler(urllib.request.ProxyHandler):
+    def proxy_open(self, req, proxy, type):
+        orig_type = req.type
+        parsed = urllib.parse.urlsplit(proxy)
+        proxy_type = (parsed.scheme or orig_type).lower()
+        req.set_proxy(parsed.netloc, proxy_type)
+        if orig_type == proxy_type or orig_type == "https":
+            return None  # let the regular HTTP(S) handlers send it (HTTPS via CONNECT)
+        return self.parent.open(req, timeout=req.timeout)
+
+
 # Build a urllib opener that routes through proxy, which is a "scheme://host:port"
 # string from Connection settings' proxy protocol dropdown (see _current_proxy), or
-# None/empty for a direct connection. Plain HTTP proxies use urllib's built-in
-# ProxyHandler; urllib has no native SOCKS support, so a "socks5://" proxy is routed
-# through PySocks instead (the same optional dependency yt-dlp itself relies on for
-# --proxy socks5://... , so it's already expected to be present wherever proxy
-# support matters). Raises urllib.error.URLError - caught the same way every caller
-# already handles connection failures - if PySocks isn't installed or the scheme
-# isn't recognized, so callers don't need any extra exception handling.
+# None/empty for a DIRECT connection. Every branch pins urllib's proxy handling
+# explicitly: left to its default, urllib silently picks up HTTP(S)_PROXY / system proxy
+# settings, so with the proxy switched off this app's own requests could still be going
+# through some other proxy while yt-dlp (told --proxy "") connected directly - and with
+# one switched on, a stray environment proxy could wrap the SOCKS connection. Raises
+# urllib.error.URLError - caught the same way every caller already handles connection
+# failures - if the proxy is misconfigured (PROXY_BLOCKED) or the scheme isn't recognized.
 def _build_proxy_opener(proxy):
+    if proxy == PROXY_BLOCKED:
+        raise urllib.error.URLError(PROXY_BLOCKED_MESSAGE)
     if not proxy:
-        return urllib.request.build_opener()
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
     parsed = urllib.parse.urlsplit(proxy)
     scheme = (parsed.scheme or "http").lower()
     if scheme in ("http", "https"):
-        return urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        return urllib.request.build_opener(_ForcedProxyHandler({"http": proxy, "https": proxy}))
     if scheme != "socks5":
         raise urllib.error.URLError(f"Unsupported proxy scheme: {scheme!r}")
-    try:
-        import socks  # PySocks
-    except ImportError as exc:
-        raise urllib.error.URLError(
-            "SOCKS5 proxy support requires the 'PySocks' package (pip install PySocks)"
-        ) from exc
 
     socks_host, socks_port = parsed.hostname, parsed.port
+    if not socks_host or not socks_port:
+        raise urllib.error.URLError("SOCKS5 proxy needs a host and a port")
+
+    def _numeric_timeout(value):
+        return value if isinstance(value, (int, float)) else None
 
     class _Socks5HTTPConnection(http.client.HTTPConnection):
         def connect(self):
-            self.sock = socks.socksocket()
-            self.sock.set_proxy(socks.SOCKS5, socks_host, socks_port)
-            self.sock.settimeout(self.timeout)
-            self.sock.connect((self.host, self.port))
+            self.sock = _socks5_connect(
+                socks_host, socks_port, self.host, self.port, _numeric_timeout(self.timeout),
+            )
 
     class _Socks5HTTPSConnection(http.client.HTTPSConnection):
         def connect(self):
-            raw_sock = socks.socksocket()
-            raw_sock.set_proxy(socks.SOCKS5, socks_host, socks_port)
-            raw_sock.settimeout(self.timeout)
-            raw_sock.connect((self.host, self.port))
-            context = self._context or ssl.create_default_context()
-            self.sock = context.wrap_socket(raw_sock, server_hostname=self.host)
+            raw_sock = _socks5_connect(
+                socks_host, socks_port, self.host, self.port, _numeric_timeout(self.timeout),
+            )
+            try:
+                context = self._context or ssl.create_default_context()
+                self.sock = context.wrap_socket(raw_sock, server_hostname=self.host)
+            except BaseException:
+                raw_sock.close()
+                raise
 
     class _Socks5HTTPHandler(urllib.request.HTTPHandler):
         def http_open(self, req):
@@ -1071,7 +1201,9 @@ def _build_proxy_opener(proxy):
         def https_open(self, req):
             return self.do_open(_Socks5HTTPSConnection, req)
 
-    return urllib.request.build_opener(_Socks5HTTPHandler(), _Socks5HTTPSHandler())
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _Socks5HTTPHandler(), _Socks5HTTPSHandler(),
+    )
 
 
 # Ask GitHub for this app's own latest released version ("tag_name", a dated
@@ -1118,6 +1250,11 @@ SINGLE_INSTANCE_KEY = f"{APP_NAME}-single-instance-lock"
 # there isn't one after all - kept short since this only blocks startup, and a
 # real running instance answers almost instantly.
 SINGLE_INSTANCE_CONNECT_TIMEOUT_MS = 500
+# How long closing the window waits, in total, for cancelled downloads/probes/updates to
+# actually wind down before giving up on them - see MainWindow._shutdown_background_work.
+SHUTDOWN_WAIT_MS = 5000
+# After a failed links save, how long the autosave tick waits before trying again
+LINKS_SAVE_RETRY_SECONDS = 10
 
 
 # Claims a genuinely OS-atomic single-instance lock - a Windows named mutex, or
@@ -1142,29 +1279,75 @@ SINGLE_INSTANCE_CONNECT_TIMEOUT_MS = 500
 # stays alive for the process's whole lifetime purely by still being on the
 # stack inside app.exec()) for as long as the app runs - dropping/closing it
 # releases the lock - or None if another instance already holds it.
-def _acquire_os_instance_lock():
-    if sys.platform == "win32":
-        import ctypes
-        ERROR_ALREADY_EXISTS = 183
-        handle = ctypes.windll.kernel32.CreateMutexW(
-            None, True, f"Global\\{SINGLE_INSTANCE_KEY}"
-        )
-        if not handle or ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-            return None
-        return handle
+#
+# There is a third outcome, _INSTANCE_LOCK_UNAVAILABLE: the lock couldn't be taken
+# for a reason that says nothing about another instance (the app folder and the
+# system temp dir both unwritable, a filesystem without flock support, ...). That is
+# NOT reported as None - which main() reads as "someone else is running, quit" - so a
+# read-only install folder no longer makes every launch exit (or crash) without a
+# window. The app just starts without single-instance protection instead.
+_INSTANCE_LOCK_UNAVAILABLE = object()
 
+
+# Try to flock() lock_path exclusively without blocking. Returns (fd, "ok") on
+# success, (None, "held") if another process already holds it, or (None, "error") if
+# the lock couldn't be attempted at all (can't create the file, flock unsupported).
+def _try_flock(lock_path):
+    import errno
     import fcntl
-    lock_path = _app_dir() / ".instance.lock"
     try:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        return None, "error"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
         try:
             os.close(fd)
         except OSError:
             pass
-        return None
-    return fd
+        held = exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES)
+        return None, "held" if held else "error"
+    return fd, "ok"
+
+
+def _acquire_os_instance_lock():
+    if sys.platform == "win32":
+        import ctypes
+        ERROR_ACCESS_DENIED = 5
+        ERROR_ALREADY_EXISTS = 183
+        # use_last_error + get_last_error() reads the error code captured right after
+        # the call; calling GetLastError() separately afterwards is not reliable from
+        # Python, since other Win32 calls can run in between and overwrite it.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        handle = kernel32.CreateMutexW(None, True, f"Global\\{SINGLE_INSTANCE_KEY}")
+        error = ctypes.get_last_error()
+        if not handle:
+            # Access denied means the mutex exists but belongs to something we can't
+            # open (e.g. an elevated instance) - that is another instance. Anything
+            # else says nothing about other instances.
+            return None if error == ERROR_ACCESS_DENIED else _INSTANCE_LOCK_UNAVAILABLE
+        if error == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return None
+        return handle
+
+    # Prefer a lock file next to the app; if that folder isn't writable fall back to a
+    # per-user file in the system temp dir.
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    for lock_path in (
+        _app_dir() / ".instance.lock",
+        Path(tempfile.gettempdir()) / f"{APP_NAME}-{uid}.lock",
+    ):
+        fd, state = _try_flock(lock_path)
+        if state == "ok":
+            return fd
+        if state == "held":
+            return None
+    return _INSTANCE_LOCK_UNAVAILABLE
 
 
 # Try to reach an already-running instance of the app via its local socket
@@ -1284,6 +1467,21 @@ PROFILE_TYPES = ["Generic video", "Generic file", "Playlist", "Channel", "Sub Gr
 # QDesktopServices.openUrl (which can only open a folder, never select a file inside
 # it) on platforms/setups where the OS-specific reveal command isn't available.
 # Returns True if something was launched, False if even the fallback failed.
+def _spawn_detached(args):
+    # Fire-and-forget launch of a file-manager command. The Popen object is reaped by a
+    # throwaway daemon thread (wait()) so the child never lingers as a zombie on
+    # Unix, stdio is detached so it can't block on or write into our pipes, and on
+    # Unix it gets its own session so closing/killing this app doesn't take the file
+    # manager window down with it. Raises OSError if the program can't be started.
+    kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL,
+              "stderr": subprocess.DEVNULL}
+    if not sys.platform.startswith("win"):
+        kwargs["start_new_session"] = True
+        kwargs["close_fds"] = True
+    proc = subprocess.Popen(args, **kwargs)
+    threading.Thread(target=proc.wait, daemon=True).start()
+
+
 def _reveal_path(path):
     p = Path(path)
     is_file = p.is_file()
@@ -1293,15 +1491,15 @@ def _reveal_path(path):
                 # The trailing comma after /select is significant to explorer.exe's
                 # (undocumented) argument parsing - splitting it into its own list
                 # element like this is what makes that survive subprocess escaping.
-                subprocess.Popen(["explorer", "/select,", str(p)])
+                _spawn_detached(["explorer", "/select,", str(p)])
             else:
-                subprocess.Popen(["explorer", str(p)])
+                _spawn_detached(["explorer", str(p)])
             return True
         if sys.platform == "darwin":
             if is_file:
-                subprocess.Popen(["open", "-R", str(p)])
+                _spawn_detached(["open", "-R", str(p)])
             else:
-                subprocess.Popen(["open", str(p)])
+                _spawn_detached(["open", str(p)])
             return True
         # Linux/other Unix: no universal "reveal and select" command. Try file
         # managers that support one, in rough order of how common they are;
@@ -1310,7 +1508,7 @@ def _reveal_path(path):
             for args in (["nautilus", "--select", str(p)], ["dolphin", "--select", str(p)],
                          ["nemo", str(p)], ["thunar", str(p)]):
                 if shutil.which(args[0]):
-                    subprocess.Popen(args)
+                    _spawn_detached(args)
                     return True
     except OSError:
         pass
@@ -1503,7 +1701,12 @@ def _app_icon_path():
 # executables in by hand.
 def _bundled_bin_dir():
     path = _app_dir() / "ytdlp-bin"
-    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Not fatal here: installing yt-dlp/ffmpeg into it fails later with a clear
+        # message in the log (see update_ytdlp/update_ffmpeg), which beats a startup crash.
+        pass
     return path
 
 
@@ -1579,7 +1782,7 @@ def load_last_profile_name():
 # a name, so it's fine that it doesn't travel with a profile folder that gets copied
 # elsewhere for backup/restore.
 def save_last_profile_name(name):
-    _save_json_file(_last_profile_file_path(), {"last_profile": name})
+    return _save_json_file(_last_profile_file_path(), {"last_profile": name})
 
 
 # Where a given (non-Default) profile's folder would live, without creating it.
@@ -1630,7 +1833,7 @@ def load_enabled_plugins():
 
 # Persist the list of currently-added plugin filenames
 def save_enabled_plugins(names):
-    _save_json_file(_plugins_enabled_file_path(), {"enabled": list(names)})
+    return _save_json_file(_plugins_enabled_file_path(), {"enabled": list(names)})
 
 
 # A .py file only counts as a plugin if its first line is exactly the marker
@@ -1666,7 +1869,7 @@ def load_profile_metadata(name):
 # same as "channel_url" already does for a Channel profile.
 def save_profile_metadata(name, ptype, channel_url, channels=None, number_by_upload_order=False,
                            playlist_url=None):
-    _save_json_file(_dir_for_profile(name) / PROFILE_METADATA_FILENAME, {
+    return _save_json_file(_dir_for_profile(name) / PROFILE_METADATA_FILENAME, {
         "name": name, "type": ptype, "channel_url": channel_url, "channels": channels,
         "number_by_upload_order": bool(number_by_upload_order), "playlist_url": playlist_url,
     })
@@ -1696,10 +1899,21 @@ def _discover_profiles():
             if not entry.is_dir():
                 continue
             meta = _load_json_file(entry / PROFILE_METADATA_FILENAME)
-            if not isinstance(meta, dict) or not meta.get("name"):
+            if not isinstance(meta, dict):
+                continue
+            # The folder's own name IS the profile's identity - not the "name" stored
+            # inside its profile.json. Every path helper (_profile_dir_path,
+            # _dir_for_profile, ...) rebuilds the folder from the profile name, so a
+            # folder copied/restored under a different name would otherwise be listed
+            # under its old json name and then read from a folder that doesn't exist
+            # (or, worse, a different profile's folder). Skip any folder whose name
+            # couldn't be turned back into the same path (characters the sanitizer
+            # strips) or that would alias the Default profile's app-folder data.
+            name = entry.name
+            if name == DEFAULT_PROFILE_NAME or _sanitize_profile_name(name) != name:
                 continue
             profiles.append({
-                "name": meta["name"],
+                "name": name,
                 "type": meta.get("type"),
                 "channel_url": meta.get("channel_url"),
                 "channels": meta.get("channels"),
@@ -1809,7 +2023,7 @@ def _collect_download_paths_from_nodes(nodes):
 
 # Existing cached thumbnail file for a link UUID, if any (matched regardless of extension)
 def _existing_thumbnail_path(link_uuid):
-    if not link_uuid:
+    if not _is_safe_link_uuid(link_uuid):
         return None
     return next(_thumbnails_dir().glob(f"{link_uuid}.*"), None)
 
@@ -1822,28 +2036,72 @@ def _existing_thumbnail_path(link_uuid):
 # process can read) and have its contents silently written into the thumbnails
 # folder. Raises ValueError for anything else, which download_thumbnail already
 # treats as an ordinary failed download.
-def _download_to_file(url, dest_path, timeout, proxy=None):
+#
+# The body is streamed to disk in chunks and capped at max_bytes (a hostile or broken
+# server can otherwise send an endless/huge body that resp.read() would pull into
+# memory in one go). A declared Content-Length over the cap is rejected up front, and
+# so is a Content-Type that is clearly not an image (HTML error pages, JSON, ...);
+# a missing type or a generic application/octet-stream is tolerated, since plenty of
+# CDNs serve real thumbnails that way. A partial/rejected file is never left behind.
+_THUMBNAIL_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _download_to_file(url, dest_path, timeout, proxy=None, max_bytes=_THUMBNAIL_MAX_BYTES):
     if urllib.parse.urlparse(url).scheme not in ("http", "https"):
         raise ValueError(f"refusing to download non-http(s) url: {url!r}")
     opener = _build_proxy_opener(proxy)
-    with opener.open(url, timeout=timeout) as resp:
-        dest_path.write_bytes(resp.read())
+    try:
+        with opener.open(url, timeout=timeout) as resp:
+            content_type = (resp.headers.get("Content-Type", "") if resp.headers else "")
+            content_type = content_type.split(";", 1)[0].strip().lower()
+            if content_type and not (
+                content_type.startswith("image/")
+                or content_type in ("application/octet-stream", "binary/octet-stream")
+            ):
+                raise ValueError(f"refusing non-image content type: {content_type!r}")
+            declared = resp.headers.get("Content-Length") if resp.headers else None
+            if declared and declared.isdigit() and int(declared) > max_bytes:
+                raise ValueError(f"thumbnail too large: {declared} bytes (limit {max_bytes})")
+            total = 0
+            with open(dest_path, "wb") as f:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError(f"thumbnail too large (limit {max_bytes} bytes)")
+                    f.write(chunk)
+    except BaseException:
+        try:
+            Path(dest_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # Download a link's thumbnail (if thumbnail_url is present) into thumbnails/<uuid><ext>,
 # replacing any previously cached thumbnail for that UUID. Failures are non-fatal since
 # a missing thumbnail shouldn't stop a probe from succeeding.
-def download_thumbnail(thumbnail_url, link_uuid, timeout, proxy=None):
-    if not thumbnail_url or not link_uuid:
+# error_sink, if given, is a list that gets one short human-readable reason appended when
+# the download fails - without it a thumbnail that never shows up (proxy down, blocked,
+# bad URL, HTTP 403...) is indistinguishable from a site that simply has none.
+def download_thumbnail(thumbnail_url, link_uuid, timeout, proxy=None, error_sink=None):
+    if not thumbnail_url or not _is_safe_link_uuid(link_uuid):
         return None
-    remove_thumbnail(link_uuid)
-    ext = Path(urllib.parse.urlparse(thumbnail_url).path).suffix
-    if not ext or len(ext) > 5:
-        ext = ".jpg"
-    dest = _thumbnails_dir() / f"{link_uuid}{ext}"
     try:
+        remove_thumbnail(link_uuid)
+        ext = Path(urllib.parse.urlparse(thumbnail_url).path).suffix
+        if not ext or len(ext) > 5:
+            ext = ".jpg"
+        dest = _thumbnails_dir() / f"{link_uuid}{ext}"
         _download_to_file(thumbnail_url, dest, timeout, proxy)
-    except (OSError, ValueError, urllib.error.URLError):
+    except Exception as exc:
+        if error_sink is not None:
+            plain_url_error = (isinstance(exc, urllib.error.URLError)
+                               and not isinstance(exc, urllib.error.HTTPError))
+            text = str(exc.reason) if plain_url_error else str(exc)
+            error_sink.append(text.strip() or type(exc).__name__)
         return None
     return dest.as_posix()
 
@@ -1860,46 +2118,202 @@ def _load_json_file(path):
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
     return data
 
 
-# Write JSON data to the given path atomically via a temp file + rename
-def _save_json_file(path, data):
+# Backup file kept next to a user-data JSON file (see _save_json_file's keep_backup)
+def _backup_path_for(path):
+    return path.with_name(path.name + ".bak")
+
+
+# Move an unreadable/invalid user-data file out of the way instead of leaving it in
+# place for the next save to silently overwrite - it may be the user's only copy of
+# their links/settings, and is often recoverable by hand (e.g. one stray character).
+# Returns the new path, or None if it couldn't be moved.
+def _quarantine_corrupt_file(path):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_name(f"{path.name}.corrupt-{stamp}")
+    n = 1
+    while target.exists():
+        n += 1
+        target = path.with_name(f"{path.name}.corrupt-{stamp}-{n}")
     try:
-        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".tmp")
+        path.replace(target)
+    except OSError:
+        return None
+    return target
+
+
+# Like _load_json_file, for the files whose loss really hurts (settings.json,
+# links.json): a file that exists but can't be parsed (or isn't a JSON object) is
+# quarantined, then the last good backup is tried; the outcome is queued for the user
+# via the same report channel as save failures. A file that simply doesn't exist is NOT
+# touched or restored - that's a fresh profile, not damage. Returns a dict or None.
+def _load_json_file_with_recovery(path):
+    if not path.exists():
+        return None
+    data = _load_json_file(path)
+    if isinstance(data, dict):
+        return data
+    moved = _quarantine_corrupt_file(path)
+    where = f"moved to {moved.name}" if moved else "could not be moved aside"
+    backup = _backup_path_for(path)
+    restored = _load_json_file(backup) if backup.is_file() else None
+    if isinstance(restored, dict):
+        # Put the recovered data back in place right away, so the file exists again even
+        # if the app exits before its next save.
         try:
-            with open(fd, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            Path(tmp_name).replace(path)
-        except Exception:
-            Path(tmp_name).unlink(missing_ok=True)
-            raise
+            shutil.copyfile(backup, path)
+        except OSError:
+            pass
+    with _write_report_lock:
+        if isinstance(restored, dict):
+            _pending_write_reports.append((
+                "error",
+                f"{path.name} was unreadable ({where}); restored the most recent "
+                f"automatic backup, so the last minute or so of changes may be missing.",
+            ))
+        else:
+            _pending_write_reports.append((
+                "error",
+                f"{path.name} was unreadable ({where}) and no usable backup exists. "
+                f"Starting empty - the damaged file was kept next to it for manual recovery.",
+            ))
+    return restored if isinstance(restored, dict) else None
+
+
+# Files that currently can't be written (path -> reason), and the not-yet-shown
+# reports about them. A save failing used to be swallowed completely, so a read-only
+# install folder or a full disk meant links and settings silently never persisted.
+# Each path reports once when it starts failing (not on every retry) and once more
+# when it starts working again; the GUI drains these via take_pending_write_reports()
+# on its once-a-second tick, which also keeps this safe to call from any thread.
+_write_failures = {}
+_pending_write_reports = []
+_write_report_lock = threading.Lock()
+
+
+# Record the outcome of one save: exc is None on success, else the failure
+def _note_write_result(path, exc=None):
+    key = str(path)
+    with _write_report_lock:
+        if exc is not None:
+            if key not in _write_failures:
+                reason = getattr(exc, "strerror", None) or str(exc) or type(exc).__name__
+                _write_failures[key] = reason
+                _pending_write_reports.append((
+                    "error",
+                    f"Could not save {path.name} in {path.parent}: {reason}. Changes won't "
+                    f"be kept until this is fixed; retrying automatically.",
+                ))
+        elif _write_failures.pop(key, None) is not None:
+            _pending_write_reports.append(("ok", f"Saving {path.name} works again"))
+
+
+# Drain the reports queued since the last call, as a list of (kind, text) pairs where
+# kind is "error" or "ok"
+def take_pending_write_reports():
+    with _write_report_lock:
+        reports = list(_pending_write_reports)
+        _pending_write_reports.clear()
+    return reports
+
+
+# Files that are failing to save right now, as {path: reason}
+def current_write_failures():
+    with _write_report_lock:
+        return dict(_write_failures)
+
+
+# Minimum seconds between refreshes of a file's ".bak" (see _save_json_file) - saves can
+# fire many times a minute during downloads, and copying the file every time is wasteful.
+_BACKUP_MIN_INTERVAL_S = 60
+
+
+# Refresh path's ".bak" from the file currently on disk (i.e. the previous good save),
+# at most once per _BACKUP_MIN_INTERVAL_S. Best effort: a failed backup never blocks the
+# real save. The copy goes through a temp name + replace so the .bak is never half-written.
+def _refresh_backup(path):
+    backup = _backup_path_for(path)
+    try:
+        if not path.is_file() or path.stat().st_size == 0:
+            return
+        if backup.exists() and time.time() - backup.stat().st_mtime < _BACKUP_MIN_INTERVAL_S:
+            return
+        staging = backup.with_name(backup.name + ".tmp")
+        shutil.copyfile(path, staging)
+        staging.replace(backup)
     except OSError:
         pass
 
 
+# Flush a just-renamed file's directory entry to disk (POSIX only; Windows can't open
+# a directory like this and NTFS journals the rename anyway). Best effort.
+def _fsync_directory(directory):
+    if sys.platform.startswith("win"):
+        return
+    try:
+        dir_fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+# Write JSON data to the given path atomically via a temp file + rename. Returns
+# True on success, False if it couldn't be written (also recorded - see above - so the
+# user gets told). Never raises: a save is called from Qt slots and timers.
+# The temp file is fsync'd before the rename (and the directory after it), so a power cut
+# can't leave a renamed-but-empty file - without that, some filesystems commit the rename
+# before the data. keep_backup=True also keeps a rolling "<name>.bak" of the previous save.
+def _save_json_file(path, data, keep_backup=False):
+    tmp_name = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".tmp")
+        with open(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if keep_backup:
+            _refresh_backup(path)
+        Path(tmp_name).replace(path)
+        _fsync_directory(path.parent)
+    except Exception as exc:
+        if tmp_name is not None:
+            try:
+                Path(tmp_name).unlink(missing_ok=True)
+            except OSError:
+                pass
+        _note_write_result(path, exc)
+        return False
+    _note_write_result(path)
+    return True
+
+
 # Load saved settings from disk, returning None if missing or invalid
 def load_settings_file():
-    data = _load_json_file(_settings_file_path())
-    return data if isinstance(data, dict) else None
+    return _load_json_file_with_recovery(_settings_file_path())
 
 
 # Write settings to disk atomically
 def save_settings_file(data):
-    _save_json_file(_settings_file_path(), data)
+    return _save_json_file(_settings_file_path(), data, keep_backup=True)
 
 
 # Load the saved URL/folder tree from disk, returning None if missing or invalid
 def load_links_file():
-    data = _load_json_file(_links_file_path())
-    return data if isinstance(data, dict) else None
+    return _load_json_file_with_recovery(_links_file_path())
 
 
 # Write the URL/folder tree to disk atomically
 def save_links_file(data):
-    _save_json_file(_links_file_path(), data)
+    return _save_json_file(_links_file_path(), data, keep_backup=True)
 
 
 # Run "yt-dlp -j <url>" (optionally through a proxy) using the given quality setting,
@@ -1912,7 +2326,7 @@ def probe_url(url, timeout, quality, proxy=None, process_holder=None, is_file=Fa
     command = [_ytdlp_cmd(), "--no-playlist", "--no-warnings", "-j"]
     # yt-dlp autodetects the system/env proxy when --proxy is omitted entirely, so
     # an explicit "no proxy" state has to pass --proxy "" to force a direct connection
-    command += ["--proxy", proxy or ""]
+    command += ["--proxy", _ytdlp_proxy_arg(proxy)]
     if not is_file:
         command += _format_args_for_quality(quality)
     # "--" forces everything after it to be treated as a positional argument,
@@ -1934,7 +2348,7 @@ def probe_url(url, timeout, quality, proxy=None, process_holder=None, is_file=Fa
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_process_tree(proc)
         proc.communicate()
         raise
     if proc.returncode != 0:
@@ -1949,6 +2363,9 @@ def probe_url(url, timeout, quality, proxy=None, process_holder=None, is_file=Fa
         # showing "probing" forever with no error surfaced).
         raise RuntimeError("probe failed: yt-dlp returned no output")
     data = json.loads(stdout_lines[0])
+    if not isinstance(data, dict):
+        # e.g. a bare "null" or a list - data.get() below would raise AttributeError
+        raise RuntimeError("probe failed: yt-dlp returned unexpected output")
     title = data.get("title") or url
     if is_file:
         # No video/audio format was requested, so "height" (or its absence, which
@@ -1976,6 +2393,25 @@ def probe_url(url, timeout, quality, proxy=None, process_holder=None, is_file=Fa
 
 
 
+# Value to hand yt-dlp's --proxy for the given proxy URL ("scheme://host:port", as built by
+# _current_proxy), or "" for a direct connection. yt-dlp treats "socks5://" as "resolve
+# hostnames locally, then ask the proxy to connect to the IP", which sends every DNS lookup
+# outside the tunnel (visible to the ISP, and exactly what DNS-poisoning censorship
+# interferes with). "socks5h://" makes the proxy do the resolving instead, matching what
+# _build_proxy_opener already does for this app's own requests (PySocks defaults to remote
+# DNS). HTTP proxies and the empty/None case pass through unchanged.
+def _ytdlp_proxy_arg(proxy):
+    if proxy == PROXY_BLOCKED:
+        # Raised before any yt-dlp process is spawned; every task wrapper already
+        # reports a RuntimeError to the user as that item's error
+        raise RuntimeError(PROXY_BLOCKED_MESSAGE)
+    if not proxy:
+        return ""
+    if proxy.lower().startswith("socks5://"):
+        return "socks5h://" + proxy[len("socks5://"):]
+    return proxy
+
+
 # Environment for every yt-dlp subprocess we launch. Without this, yt-dlp (a Python
 # program itself) picks its *own* stdout encoding from the system locale - on Windows
 # that's commonly cp1252, which can't represent characters yt-dlp substitutes into
@@ -1998,12 +2434,41 @@ def _subprocess_env():
 # briefly flashing a console window for the child process. yt-dlp is a
 # console-subsystem program, so even though *our* process is built with
 # --windowed, Windows still pops up a (very brief) console for yt-dlp itself
-# unless explicitly told not to via CREATE_NO_WINDOW. This is a no-op on
-# non-Windows platforms, where the flag doesn't exist.
+# unless explicitly told not to via CREATE_NO_WINDOW. On other platforms it starts the
+# child in its own session/process group instead, so _kill_process_tree can take down
+# the whole group (yt-dlp's standalone builds are launcher + child, and yt-dlp itself
+# spawns ffmpeg) rather than just the launcher.
 def _subprocess_no_window_kwargs():
     if sys.platform == "win32":
         return {"creationflags": subprocess.CREATE_NO_WINDOW}
-    return {}
+    return {"start_new_session": True}
+
+
+# Kill a subprocess started with _subprocess_no_window_kwargs() *and everything it
+# spawned*. A plain Popen.kill() only kills the process itself: yt-dlp's standalone
+# builds are a launcher that runs the real program as a child, so killing just the
+# launcher leaves that child (and any ffmpeg under it) running on, reparented to init,
+# still downloading with no window to show it. On Windows this is taskkill /T (kill the
+# tree); elsewhere it's SIGKILL to the process group the child was started in. Does
+# nothing if the process has already exited (guards against signalling a recycled
+# pid); falls back to a plain kill() if the tree kill isn't available or fails.
+def _kill_process_tree(proc):
+    if proc.poll() is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
 
 
 # Run "yt-dlp --version" and return the reported version string, or None if
@@ -2078,10 +2543,11 @@ def update_ytdlp(timeout=180, log=None, proxy=None):
         log("yt-dlp not found - downloading a fresh copy")
         return _download_ytdlp_fresh(timeout=timeout, log=log, proxy=proxy)
 
-    log("Running: yt-dlp -U")
+    log("Running: yt-dlp -U" + (" (via proxy)" if proxy else ""))
     try:
         result = subprocess.run(
-            [_ytdlp_cmd(), "-U"], capture_output=True, text=True,
+            [_ytdlp_cmd(), "--proxy", _ytdlp_proxy_arg(proxy), "-U"],
+            capture_output=True, text=True,
             encoding="utf-8", errors="replace", env=_subprocess_env(), timeout=timeout,
             **_subprocess_no_window_kwargs(),
         )
@@ -2190,55 +2656,119 @@ def _ffmpeg_release_asset_name():
     return f"ffmpeg-master-latest-{'linuxarm64' if is_arm else 'linux64'}-gpl.tar.xz"
 
 
-# Whether target resolves to somewhere inside directory (or directory itself) -
-# used by _extract_ffmpeg_binary to guard against a malicious archive entry (e.g.
-# "../../../../some/file" or an absolute path) that would otherwise let
-# extractall() write outside the intended destination folder ("zip slip"/"tar
-# slip", CWE-22).
+# Whether target resolves to somewhere inside directory (or directory itself) - used
+# by _extract_ffmpeg_binary as a second check on the one archive entry it extracts
+# (against e.g. "../../../../some/file" or an absolute path: "zip slip"/"tar slip",
+# CWE-22).
 def _is_within_directory(directory, target):
     directory = Path(directory).resolve()
     target = Path(target).resolve()
     return directory == target or directory in target.parents
 
 
-# Extract every member of archive (a ZipFile or TarFile) into dest_dir, first
-# checking that every member's path - and, for tar entries, the target of any
-# symlink/hardlink - actually resolves to somewhere inside dest_dir. Raises
-# ValueError on the first entry that doesn't, without extracting anything from
-# that entry onward. This is purely a safety check on top of extractall(); it
-# doesn't change what a well-formed archive extracts to.
-def _safe_extractall(archive, dest_dir):
-    dest_dir = Path(dest_dir).resolve()
-    is_tar = isinstance(archive, tarfile.TarFile)
-    members = archive.getmembers() if is_tar else archive.infolist()
-    for member in members:
-        name = member.name if is_tar else member.filename
-        target = dest_dir / name
-        if not _is_within_directory(dest_dir, target):
-            raise ValueError(f"refusing to extract unsafe archive path: {name!r}")
-        if is_tar and (member.issym() or member.islnk()):
-            link_target = Path(member.linkname)
-            if not link_target.is_absolute():
-                link_target = target.parent / link_target
-            if not _is_within_directory(dest_dir, link_target):
-                raise ValueError(
-                    f"refusing to extract unsafe link in archive: {name!r} -> {member.linkname!r}"
-                )
-    archive.extractall(dest_dir)
+# Whether `path` is somewhere strictly inside `root`, after resolving symlinks and
+# ".." on both. Used before deleting or moving a file whose path was read back out of
+# links.json: that file sits in a profile folder that is meant to be copied, shared and
+# restored, so its contents are untrusted - a tampered "download_path" must not be able
+# to point the app's delete/move at some unrelated file. An empty root, an unresolvable
+# path, or anything that isn't a string is never "inside".
+def _is_path_inside_directory(path, root):
+    if not isinstance(path, (str, os.PathLike)) or not isinstance(root, (str, os.PathLike)):
+        return False
+    if not str(root).strip():
+        return False
+    try:
+        return Path(root).resolve() in Path(path).resolve().parents
+    except (OSError, ValueError, RuntimeError):
+        return False
 
 
-# Unpack the given release archive (.zip or .tar.xz) into dest_dir, then return the
-# path to the "ffmpeg"/"ffmpeg.exe" binary inside it (these builds nest everything
-# under "<archive-root>/bin/"), or None if it can't be found
+# Qt decides for itself whether a string is rich text: QTextEdit.append(), QLabel (in
+# its default AutoText mode), tooltips and QMessageBox all render anything that looks
+# like HTML as HTML. Video titles, uploader names, yt-dlp output, URLs, profile names
+# (folder names) and file paths are all outside the app's control, so one containing
+# "<b>", "<a href=...>" or "<img ...>" would be rendered - spoofing log lines, planting
+# clickable links, making the UI look like something it isn't. Anything showing such
+# text is forced to plain text instead; these two helpers cover the cases where that
+# can't be a one-time setTextFormat().
+#
+# A tooltip showing `text` literally: escaped, and wrapped in a paragraph so Qt treats
+# the (now harmless) result as rich text - which, as a bonus, word-wraps long titles.
+def _plain_tooltip(text):
+    return f"<p>{html.escape(text)}</p>" if text else ""
+
+
+# Modal message box that shows `text` literally, for messages that include a name or
+# path (QMessageBox.question()/information() always auto-detect rich text). Returns the
+# clicked StandardButton.
+def _show_plain_message(parent, icon, title, text,
+                        buttons=QMessageBox.StandardButton.Ok,
+                        default=QMessageBox.StandardButton.NoButton):
+    box = QMessageBox(icon, title, text, buttons, parent)
+    box.setTextFormat(Qt.TextFormat.PlainText)
+    if default != QMessageBox.StandardButton.NoButton:
+        box.setDefaultButton(default)
+    return box.exec()
+
+
+# Link UUIDs come from links.json too, and are used to build thumbnail filenames and a
+# glob pattern. Real ones are uuid4 strings; accept only that kind of plain token, so a
+# tampered value can't contain path separators, "..", or glob wildcards.
+_SAFE_LINK_UUID_RE = re.compile(r"[0-9A-Za-z_-]{1,64}")
+
+
+def _is_safe_link_uuid(value):
+    return isinstance(value, str) and _SAFE_LINK_UUID_RE.fullmatch(value) is not None
+
+
+# Pick the ffmpeg binary out of an archive's regular-file entry names: the one whose file
+# name is exactly bin_name, preferring an entry directly under a "bin" folder (these
+# builds nest everything under "<archive-root>/bin/"), else the shortest path. Returns
+# the entry name as stored (always "/"-separated), or None if there isn't one.
+def _pick_ffmpeg_member(names, bin_name):
+    matches = [n for n in names if PurePosixPath(n).name == bin_name]
+    if not matches:
+        return None
+    in_bin = [n for n in matches if PurePosixPath(n).parent.name == "bin"]
+    return min(in_bin or matches, key=len)
+
+
+# Extract just the ffmpeg binary from the given release archive (.zip or .tar.xz) into
+# dest_dir and return its path, or None if the archive doesn't contain one. This is
+# deliberately not a full extractall(): the archive also holds ffprobe/ffplay/docs the
+# app never uses, and extracting a single regular-file entry means no symlinks or other
+# special entries are ever created - which is what defeats tar "symlink chain" escapes
+# that a per-entry pre-check can't see (l1 -> ".", then l1/l2 -> "..", then a file at
+# l1/l2/x lands outside dest_dir). On top of that, the entry's path is re-checked to be
+# inside dest_dir, and the tar path uses tarfile's own "data" filter wherever the
+# interpreter has it (3.12+, backported to recent 3.8-3.11 releases).
 def _extract_ffmpeg_binary(archive_path, dest_dir):
+    bin_name = _ffmpeg_bin_name()
+    dest_dir = Path(dest_dir)
     if str(archive_path).endswith(".zip"):
         with zipfile.ZipFile(archive_path) as archive:
-            _safe_extractall(archive, dest_dir)
+            name = _pick_ffmpeg_member(
+                [i.filename for i in archive.infolist() if not i.is_dir()], bin_name,
+            )
+            if name is None:
+                return None
+            if not _is_within_directory(dest_dir, dest_dir / name):
+                raise ValueError(f"refusing to extract unsafe archive path: {name!r}")
+            archive.extract(name, dest_dir)
     else:
         with tarfile.open(archive_path) as archive:
-            _safe_extractall(archive, dest_dir)
-    matches = list(Path(dest_dir).rglob(_ffmpeg_bin_name()))
-    return matches[0] if matches else None
+            regular_files = {m.name: m for m in archive.getmembers() if m.isfile()}
+            name = _pick_ffmpeg_member(list(regular_files), bin_name)
+            if name is None:
+                return None
+            if not _is_within_directory(dest_dir, dest_dir / name):
+                raise ValueError(f"refusing to extract unsafe archive path: {name!r}")
+            if hasattr(tarfile, "data_filter"):
+                archive.extract(regular_files[name], dest_dir, filter="data")
+            else:
+                archive.extract(regular_files[name], dest_dir)
+    extracted = dest_dir / name
+    return extracted if extracted.is_file() else None
 
 
 # Download this app's own copy of ffmpeg fresh from yt-dlp/FFmpeg-Builds' "latest"
@@ -2314,8 +2844,11 @@ def _download_with_resume(opener, url, dest_path, headers, timeout, log, max_sta
                         expected_size = int(cl)
                     with open(dest_path, "wb") as f:
                         shutil.copyfileobj(resp, f)
-        except OSError as e:
-            last_error = e
+        except (OSError, http.client.HTTPException) as e:
+            # HTTPException (IncompleteRead, RemoteDisconnected...) isn't an OSError, but
+            # is exactly what a connection cut short raises - treat it the same, and
+            # normalize so callers that only catch OSError still see it.
+            last_error = e if isinstance(e, OSError) else OSError(_describe_unexpected_error(e))
             stalled_attempts += 1
             log(
                 f"Download attempt {attempt} failed: {e} "
@@ -2345,6 +2878,140 @@ def _download_with_resume(opener, url, dest_path, headers, timeout, log, max_sta
         return content_type, expected_size
 
     raise last_error or OSError("download failed for an unknown reason")
+
+
+# Name of the checksum file each upstream release publishes alongside its binaries:
+# yt-dlp/yt-dlp ships "SHA2-256SUMS", yt-dlp/FFmpeg-Builds ships "checksums.sha256". Both
+# are plain "<sha256>  <filename>" lines, one per asset.
+_YTDLP_CHECKSUM_ASSET = "SHA2-256SUMS"
+_FFMPEG_CHECKSUM_ASSET = "checksums.sha256"
+# True (the safe default): a download is rejected if its checksum can't be verified at all
+# (checksum file missing, unreachable, or the asset isn't listed in it). A checksum that
+# is found and doesn't match is ALWAYS rejected, whatever this is set to. Set to False if
+# upstream ever renames/drops its checksum file and updates need to keep working meanwhile.
+REQUIRE_RELEASE_CHECKSUMS = True
+
+
+# SHA-256 hex digest of a file, read in chunks so a ~100+ MB ffmpeg archive is never
+# loaded into memory at once
+def _sha256_of_file(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# Pull the expected SHA-256 for `filename` out of a "<sha256>  <filename>" checksum file's
+# text (a leading "*" on the name is the sha256sum "binary mode" marker, ignored). None if
+# the file isn't listed or its digest isn't a well-formed 64-hex-char value.
+def _expected_sha256_for(sums_text, filename):
+    for line in sums_text.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        digest, name = parts
+        if name.strip().lstrip("*") == filename and re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            return digest.lower()
+    return None
+
+
+# Verify a downloaded release asset against the checksum file published in the same
+# release (release_data is the GitHub API JSON already fetched for it). Returns
+# (ok, detail); `log` is called with the outcome either way. See
+# REQUIRE_RELEASE_CHECKSUMS for what happens when there's simply nothing to compare
+# against - a mismatch is never let through.
+#
+# Honest scope: this catches corrupted, truncated, or tampered-in-transit downloads
+# (a bad proxy/mirror/CDN edge). It can't help if the release itself is compromised,
+# since the checksum file is published by the same source as the binary.
+def _verify_asset_checksum(opener, release_data, checksum_asset_name, asset_name,
+                           file_path, headers, timeout, log):
+    def unverifiable(reason):
+        if REQUIRE_RELEASE_CHECKSUMS:
+            return False, f"cannot verify checksum ({reason})"
+        log(f"Warning: skipping checksum verification ({reason})")
+        return True, reason
+
+    sums_url = None
+    for asset in (release_data.get("assets") or []) if isinstance(release_data, dict) else []:
+        if isinstance(asset, dict) and asset.get("name") == checksum_asset_name:
+            sums_url = asset.get("browser_download_url")
+            break
+    if not sums_url:
+        return unverifiable(f'release has no "{checksum_asset_name}" file')
+    if urllib.parse.urlparse(sums_url).scheme != "https":
+        return unverifiable("checksum file URL is not https")
+
+    log(f"Verifying {asset_name} against {checksum_asset_name}…")
+    try:
+        req = urllib.request.Request(sums_url, headers=headers)
+        with opener.open(req, timeout=timeout) as resp:
+            sums_text = resp.read(1024 * 1024).decode("utf-8", errors="replace")
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        return unverifiable(f"could not download {checksum_asset_name}: {e}")
+
+    expected = _expected_sha256_for(sums_text, asset_name)
+    if expected is None:
+        return unverifiable(f'"{asset_name}" is not listed in {checksum_asset_name}')
+
+    try:
+        actual = _sha256_of_file(file_path)
+    except OSError as e:
+        return False, f"could not hash the downloaded file: {e}"
+    if actual != expected:
+        return False, f"checksum mismatch (expected {expected}, got {actual})"
+
+    log(f"Checksum OK (sha256 {actual[:16]}…)")
+    return True, "checksum verified"
+
+
+# Put the binary at `src` in place as `dest` without ever leaving `dest` half-written.
+# Copying straight over the live executable (what this used to do) meant a crash, a
+# kill, a full disk or a power cut mid-copy left a truncated yt-dlp/ffmpeg that fails
+# every later launch - and on Windows the copy fails outright if the old one is running.
+# Instead the new file is staged next to `dest` (same folder, so the final step is a
+# same-filesystem rename), checked to be complete, then swapped in with os.replace,
+# which is atomic: dest is always either the complete old file or the complete new one.
+# Windows refuses to replace a running .exe but does allow renaming it, so on a
+# PermissionError the old file is moved aside to "<name>.old" first (and put back if
+# the swap then fails). Raises OSError on failure, leaving dest as it was.
+def _install_binary_atomically(src, dest):
+    src, dest = Path(src), Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staged = dest.with_name(dest.name + ".new")
+    old = dest.with_name(dest.name + ".old")
+    try:
+        old.unlink(missing_ok=True)  # leftover from a previous swap, if it's no longer running
+    except OSError:
+        pass
+    try:
+        staged.unlink(missing_ok=True)
+        shutil.copyfile(src, staged)
+        if staged.stat().st_size != src.stat().st_size:
+            raise OSError(f"incomplete copy of {src.name} ({staged.stat().st_size} of {src.stat().st_size} bytes)")
+        if sys.platform != "win32":
+            staged.chmod(staged.stat().st_mode | 0o111)  # carry over the +x bit
+        try:
+            os.replace(staged, dest)
+        except PermissionError:
+            if sys.platform != "win32" or not dest.exists():
+                raise
+            os.replace(dest, old)
+            try:
+                os.replace(staged, dest)
+            except OSError:
+                os.replace(old, dest)  # swap failed: restore the previous binary
+                raise
+            try:
+                old.unlink(missing_ok=True)
+            except OSError:
+                pass  # still running; removed by the next install
+    finally:
+        try:
+            staged.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 # Fetch a brand-new copy of yt-dlp straight from its latest GitHub release (the
@@ -2408,13 +3075,18 @@ def _download_ytdlp_fresh(timeout=180, log=None, proxy=None):
                 log(f"yt-dlp download did not produce a complete file ({detail})")
                 return False, f"yt-dlp download did not produce a complete file ({detail})"
 
+            ok, detail = _verify_asset_checksum(
+                opener, data, _YTDLP_CHECKSUM_ASSET, asset_name, tmp_path,
+                common_headers, timeout, log,
+            )
+            if not ok:
+                log(f"yt-dlp download rejected: {detail}")
+                return False, f"yt-dlp download rejected: {detail}"
+
             log("Installing new yt-dlp…")
             dest = _ytdlp_bin_path()
             try:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(tmp_path, dest)
-                if sys.platform != "win32":
-                    dest.chmod(dest.stat().st_mode | 0o111)  # carry over the +x bit
+                _install_binary_atomically(tmp_path, dest)
             except OSError as e:
                 log(f"Failed to install new yt-dlp: {e}")
                 return False, f"Failed to install new yt-dlp: {e}"
@@ -2511,6 +3183,14 @@ def update_ffmpeg(timeout=180, log=None, proxy=None):
                 )
                 return False, f"ffmpeg download did not produce a valid archive: {detail}"
 
+            ok, detail = _verify_asset_checksum(
+                opener, data, _FFMPEG_CHECKSUM_ASSET, asset_name, archive_path,
+                common_headers, timeout, log,
+            )
+            if not ok:
+                log(f"ffmpeg download rejected: {detail}")
+                return False, f"ffmpeg download rejected: {detail}"
+
             log("Extracting ffmpeg…")
             try:
                 extracted = _extract_ffmpeg_binary(archive_path, tmp_dir)
@@ -2524,9 +3204,7 @@ def update_ffmpeg(timeout=180, log=None, proxy=None):
             log("Installing new ffmpeg…")
             dest = _ffmpeg_bin_path()
             try:
-                shutil.copy2(extracted, dest)
-                if sys.platform != "win32":
-                    dest.chmod(dest.stat().st_mode | 0o111)  # carry over the +x bit
+                _install_binary_atomically(extracted, dest)
             except OSError as e:
                 log(f"Failed to install new ffmpeg: {e}")
                 return False, f"Failed to install new ffmpeg: {e}"
@@ -2614,6 +3292,73 @@ def _recover_final_path(dest_dir, reported_path):
     return str(candidates[0])
 
 
+# Longest "Ignore pattern in title" regex accepted - real patterns are a few words
+_TITLE_PATTERN_MAX_LEN = 200
+
+
+# True if the parsed regex has an unbounded repeat nested inside another unbounded
+# repeat, e.g. "(a+)+", "(\\w+\\s?)*", "(.*)*" - the classic shape of catastrophic
+# backtracking, where a title that *almost* matches can make the regex engine run for
+# minutes. Walks Python's own parse tree, so escapes and character classes are handled
+# correctly (unlike a text search for "+)+").
+def _has_nested_unbounded_repeat(parsed, c, inside=False):
+    for op, av in parsed:
+        name = getattr(op, "name", str(op))
+        if name in ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"):
+            _lo, hi, sub = av
+            unbounded = hi == c.MAXREPEAT
+            if unbounded and inside:
+                return True
+            if _has_nested_unbounded_repeat(sub, c, inside or unbounded):
+                return True
+        elif name == "SUBPATTERN":
+            if _has_nested_unbounded_repeat(av[-1], c, inside):
+                return True
+        elif name == "ATOMIC_GROUP":
+            if _has_nested_unbounded_repeat(av, c, inside):
+                return True
+        elif name == "BRANCH":
+            if any(_has_nested_unbounded_repeat(branch, c, inside) for branch in av[1]):
+                return True
+        elif name in ("ASSERT", "ASSERT_NOT"):
+            if _has_nested_unbounded_repeat(av[1], c, inside):
+                return True
+    return False
+
+
+# Validate the user's "Ignore pattern in title" regex. Returns None if it's fine, else a
+# short human-readable reason. Rejects: too long, doesn't compile, or has the nested-
+# unbounded-repeat shape that can hang yt-dlp's metadata step (the heuristic can't catch
+# every pathological regex - overlapping alternations like "(a|a)*" slip through - but it
+# covers the common ones). Used both for live feedback in the settings field and as the
+# gate right before a pattern reaches yt-dlp.
+def _check_title_pattern(pattern):
+    if not pattern:
+        return None
+    if len(pattern) > _TITLE_PATTERN_MAX_LEN:
+        return f"too long (max {_TITLE_PATTERN_MAX_LEN} characters)"
+    try:
+        re.compile(pattern)
+    except re.error as exc:
+        return f"not a valid regex: {exc}"
+    except RecursionError:
+        return "too deeply nested"
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            try:
+                from re import _parser as sre_parse, _constants as sre_constants
+            except ImportError:  # Python < 3.11
+                import sre_parse, sre_constants
+        if _has_nested_unbounded_repeat(sre_parse.parse(pattern), sre_constants):
+            return ("a repeat inside a repeat (like \"(a+)+\") can make matching extremely "
+                    "slow - simplify it")
+    except Exception:
+        pass  # heuristic only: if the internals ever change, fall back to compile-only
+    return None
+
+
 # Run "yt-dlp <url>" as a real download (not just metadata probing) into dest_dir,
 # using the same quality selection as probe_url; container/codec choice is left to
 # yt-dlp's own defaults. Calls progress_callback(percent) and speed_callback(kbps) as
@@ -2628,7 +3373,7 @@ def _recover_final_path(dest_dir, reported_path):
 def download_url(url, dest_dir, quality, retries, proxy=None,
                   progress_callback=None, speed_callback=None, process_holder=None,
                   playlist_index=None, ignore_title_pattern=None, line_callback=None,
-                  is_file=False):
+                  is_file=False, audio_as_mp3=False):
     # bestvideo+bestaudio (used for every quality except "Audio only") downloads video
     # and audio as two separate files and needs ffmpeg to merge them into one. Without
     # it, yt-dlp just prints a warning, keeps both fragment files on disk unmerged
@@ -2643,9 +3388,17 @@ def download_url(url, dest_dir, quality, retries, proxy=None,
     command = [_ytdlp_cmd(), "--no-playlist", "--no-warnings", "--newline"]
     if not is_file:
         command += ["--ffmpeg-location", str(_ffmpeg_bin_path())]
-    command += ["--proxy", proxy or ""]
+    command += ["--proxy", _ytdlp_proxy_arg(proxy)]
     if not is_file:
         command += _format_args_for_quality(quality)
+        # "Audio only as mp3" (off by default): the native stream (usually .webm/opus)
+        # is still what gets downloaded - same "-f bestaudio/best" as always - and is
+        # then converted to mp3 by ffmpeg afterwards; yt-dlp deletes the native file
+        # once the conversion succeeds. "--audio-quality 0" is ffmpeg's best VBR mp3
+        # setting (yt-dlp's default of 5 is noticeably lower). Does nothing for any
+        # quality other than "Audio only", and nothing at all when the option is off.
+        if audio_as_mp3 and quality == QUALITY_AUDIO_ONLY:
+            command += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
     command += ["--retries", str(retries)]
     # Strip the caller's "Ignore pattern in title" regex out of the title *metadata*
     # before yt-dlp evaluates the "-o" template below, so the match never makes it
@@ -2671,7 +3424,10 @@ def download_url(url, dest_dir, quality, retries, proxy=None,
         f"{playlist_index} - %(title)s [%(id)s].%(ext)s" if playlist_index
         else "%(title)s [%(id)s].%(ext)s"
     )
-    command += ["-o", f"{dest_dir.rstrip('/')}/{name_template}"]
+    # dest_dir is part of yt-dlp's *output template*, where "%(title)s"-style sequences
+    # are expanded - a folder whose name contains one (e.g. "Q%(title)s") would silently
+    # land the file in a different, auto-generated folder. "%%" is yt-dlp's literal percent.
+    command += ["-o", f"{dest_dir.rstrip('/').replace('%', '%%')}/{name_template}"]
     # "--" forces the url to be treated as a positional argument, never as an
     # option - see probe_url's identical comment for why this matters.
     command += ["--", url]
@@ -2800,6 +3556,14 @@ def _parse_duration_to_seconds(duration_str):
     return hours * 3600 + minutes * 60 + secs
 
 
+# One-line description of an exception nobody anticipated, for the error signal a
+# task's catch-all reports (str(exc) alone can be empty, e.g. a bare AttributeError()).
+def _describe_unexpected_error(exc):
+    text = str(exc).strip()
+    name = type(exc).__name__
+    return f"unexpected {name}: {text}" if text else f"unexpected {name}"
+
+
 # Emit signal, silently dropping it instead of raising if the underlying Qt
 # object it belongs to has already been destroyed. Every *Signals class below is a
 # plain QObject with no parent, kept alive only by its owning QRunnable task's
@@ -2837,8 +3601,12 @@ class YtdlpUpdateCheckTask(QRunnable):
     # Off the GUI thread: read the installed version, then (if found) the latest
     # one, and report both
     def run(self):
-        installed = get_ytdlp_version()
-        latest = get_latest_ytdlp_version(proxy=self.proxy) if installed else None
+        installed = latest = None
+        try:
+            installed = get_ytdlp_version()
+            latest = get_latest_ytdlp_version(proxy=self.proxy) if installed else None
+        except Exception:
+            pass  # report whatever was learned; None latest = "couldn't check"
         _safe_emit(self.signals.finished, installed, latest)
 
 
@@ -2867,10 +3635,17 @@ class YtdlpUpdateTask(QRunnable):
 
     # Off the GUI thread: perform the update and report success/output/new version
     def run(self):
-        success, output = update_ytdlp(
-            log=lambda msg: _safe_emit(self.signals.step, msg), proxy=self.proxy,
-        )
-        _safe_emit(self.signals.finished, success, output, get_ytdlp_version())
+        try:
+            success, output = update_ytdlp(
+                log=lambda msg: _safe_emit(self.signals.step, msg), proxy=self.proxy,
+            )
+        except Exception as exc:
+            success, output = False, f"yt-dlp update failed: {_describe_unexpected_error(exc)}"
+        try:
+            version = get_ytdlp_version()
+        except Exception:
+            version = None
+        _safe_emit(self.signals.finished, success, output, version)
 
 
 # Cross-thread signal carrier for the About tab's ffmpeg update check
@@ -2889,8 +3664,12 @@ class FfmpegUpdateCheckTask(QRunnable):
         self.signals = FfmpegUpdateCheckSignals()
 
     def run(self):
-        installed = get_ffmpeg_version()
-        latest = get_latest_ffmpeg_version(proxy=self.proxy) if installed else None
+        installed = latest = None
+        try:
+            installed = get_ffmpeg_version()
+            latest = get_latest_ffmpeg_version(proxy=self.proxy) if installed else None
+        except Exception:
+            pass
         _safe_emit(self.signals.finished, installed, latest)
 
 
@@ -2911,10 +3690,17 @@ class FfmpegUpdateTask(QRunnable):
         self.signals = FfmpegUpdateSignals()
 
     def run(self):
-        success, output = update_ffmpeg(
-            log=lambda msg: _safe_emit(self.signals.step, msg), proxy=self.proxy,
-        )
-        _safe_emit(self.signals.finished, success, output, get_ffmpeg_version())
+        try:
+            success, output = update_ffmpeg(
+                log=lambda msg: _safe_emit(self.signals.step, msg), proxy=self.proxy,
+            )
+        except Exception as exc:
+            success, output = False, f"ffmpeg update failed: {_describe_unexpected_error(exc)}"
+        try:
+            version = get_ffmpeg_version()
+        except Exception:
+            version = None
+        _safe_emit(self.signals.finished, success, output, version)
 
 
 # Cross-thread signal carrier for the About tab's app-version update check
@@ -2933,7 +3719,10 @@ class AppUpdateCheckTask(QRunnable):
         self.signals = AppUpdateCheckSignals()
 
     def run(self):
-        latest = get_latest_app_version(proxy=self.proxy)
+        try:
+            latest = get_latest_app_version(proxy=self.proxy)
+        except Exception:
+            latest = None
         _safe_emit(self.signals.finished, latest)
 
 
@@ -2964,7 +3753,7 @@ class CancellableTaskMixin:
         with self._process_lock:
             proc = self._process
         if proc is not None and proc.poll() is None:
-            proc.kill()
+            _kill_process_tree(proc)
 
     # Handed to the probe/download/fetch call as process_holder; records the running
     # process so cancel() can kill it, or kills it immediately if cancellation
@@ -2972,7 +3761,7 @@ class CancellableTaskMixin:
     def _hold_process(self, proc):
         with self._process_lock:
             if self._cancelled.is_set():
-                proc.kill()
+                _kill_process_tree(proc)
                 return
             self._process = proc
 
@@ -3010,14 +3799,26 @@ class ProbeTask(CancellableTaskMixin, QRunnable):
         except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
             if not self._cancelled.is_set():
                 _safe_emit(self.signals.error, self.item, str(exc))
+        except PermissionError:
+            if not self._cancelled.is_set():
+                _safe_emit(self.signals.error, self.item, "yt-dlp could not be run (permission denied)")
+        except Exception as exc:
+            # Anything uncaught here would end the worker without ever emitting, leaving
+            # the item showing "probing" forever
+            if not self._cancelled.is_set():
+                _safe_emit(self.signals.error, self.item, _describe_unexpected_error(exc))
         else:
             if self._cancelled.is_set():
                 return
             # Downloading the thumbnail here (still on the worker thread) keeps the UI
             # responsive; a failed/missing thumbnail must never fail the probe itself.
+            thumbnail_errors = []
             info["thumbnail_path"] = download_thumbnail(
                 info.get("thumbnail_url"), self.link_uuid, self.timeout, self.proxy,
+                error_sink=thumbnail_errors,
             )
+            if thumbnail_errors:
+                info["thumbnail_error"] = thumbnail_errors[0]
             if self._cancelled.is_set():
                 return
             _safe_emit(self.signals.finished, self.item, info)
@@ -3036,7 +3837,8 @@ class DownloadSignals(QObject):
 class DownloadTask(CancellableTaskMixin, QRunnable):
     # Stash everything download_url needs, plus cancellation/process-tracking state
     def __init__(self, item, url, dest_dir, quality, retries, proxy=None,
-                 playlist_index=None, ignore_title_pattern=None, is_file=False):
+                 playlist_index=None, ignore_title_pattern=None, is_file=False,
+                 audio_as_mp3=False):
         super().__init__()
         self.item = item
         self.url = url
@@ -3047,6 +3849,7 @@ class DownloadTask(CancellableTaskMixin, QRunnable):
         self.playlist_index = playlist_index
         self.ignore_title_pattern = ignore_title_pattern
         self.is_file = is_file
+        self.audio_as_mp3 = audio_as_mp3
         self.signals = DownloadSignals()
         self._init_cancellation()
 
@@ -3076,7 +3879,7 @@ class DownloadTask(CancellableTaskMixin, QRunnable):
                 progress_callback=self._on_progress, speed_callback=self._on_speed,
                 process_holder=self._hold_process, playlist_index=self.playlist_index,
                 ignore_title_pattern=self.ignore_title_pattern, line_callback=self._on_line,
-                is_file=self.is_file,
+                is_file=self.is_file, audio_as_mp3=self.audio_as_mp3,
             )
         except FileNotFoundError:
             if not self._cancelled.is_set():
@@ -3084,6 +3887,12 @@ class DownloadTask(CancellableTaskMixin, QRunnable):
         except RuntimeError as exc:
             if not self._cancelled.is_set():
                 _safe_emit(self.signals.error, self.item, str(exc))
+        except PermissionError:
+            if not self._cancelled.is_set():
+                _safe_emit(self.signals.error, self.item, "yt-dlp could not be run (permission denied)")
+        except Exception as exc:
+            if not self._cancelled.is_set():
+                _safe_emit(self.signals.error, self.item, _describe_unexpected_error(exc))
         else:
             if self._cancelled.is_set():
                 return
@@ -3099,7 +3908,7 @@ PLAYLIST_FETCH_TIMEOUT = 300
 # playlist's title plus the webpage URL of each entry
 def fetch_playlist(url, proxy=None, process_holder=None):
     command = [_ytdlp_cmd(), "--no-warnings", "--flat-playlist", "-J"]
-    command += ["--proxy", proxy or ""]
+    command += ["--proxy", _ytdlp_proxy_arg(proxy)]
     # "--" forces the url to be treated as a positional argument, never as an
     # option - see probe_url's identical comment for why this matters.
     command += ["--", url]
@@ -3115,13 +3924,15 @@ def fetch_playlist(url, proxy=None, process_holder=None):
     try:
         stdout, stderr = proc.communicate(timeout=PLAYLIST_FETCH_TIMEOUT)
     except subprocess.TimeoutExpired:
-        proc.kill()
+        _kill_process_tree(proc)
         proc.communicate()
         raise
     if proc.returncode != 0:
         message = (stderr or "playlist fetch failed").strip().splitlines()
         raise RuntimeError(message[-1] if message else "playlist fetch failed")
     data = json.loads(stdout)
+    if not isinstance(data, dict):
+        raise RuntimeError("playlist fetch failed: yt-dlp returned unexpected output")
     title = data.get("title") or "Playlist"
     entries = []
     for entry in data.get("entries") or []:
@@ -3196,7 +4007,7 @@ def _channel_entry_video_id(entry):
 # Returns the list of new entry URLs, newest first.
 def fetch_channel_new_entries(url, existing_ids, proxy=None, process_holder=None):
     command = [_ytdlp_cmd(), "--no-warnings", "--flat-playlist", "-j"]
-    command += ["--proxy", proxy or ""]
+    command += ["--proxy", _ytdlp_proxy_arg(proxy)]
     # "--" forces the url to be treated as a positional argument, never as an
     # option - see probe_url's identical comment for why this matters.
     command += ["--", url]
@@ -3231,7 +4042,7 @@ def fetch_channel_new_entries(url, existing_ids, proxy=None, process_holder=None
     # Mark the run as timed out and kill the process so the read loop above unblocks
     def _on_timeout():
         timed_out.set()
-        proc.kill()
+        _kill_process_tree(proc)
 
     watchdog = threading.Timer(PLAYLIST_FETCH_TIMEOUT, _on_timeout)
     watchdog.daemon = True
@@ -3256,7 +4067,7 @@ def fetch_channel_new_entries(url, existing_ids, proxy=None, process_holder=None
             entry_id = _channel_entry_video_id(entry) or _youtube_video_id(entry_url)
             if entry_id is not None and entry_id in existing_ids:
                 stopped_early = True
-                proc.kill()
+                _kill_process_tree(proc)
                 break
             entries.append(entry_url)
     finally:
@@ -3309,6 +4120,12 @@ class PlaylistExpandTask(CancellableTaskMixin, QRunnable):
         except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
             if not self._cancelled.is_set():
                 _safe_emit(self.signals.error, self.item, str(exc))
+        except PermissionError:
+            if not self._cancelled.is_set():
+                _safe_emit(self.signals.error, self.item, "yt-dlp could not be run (permission denied)")
+        except Exception as exc:
+            if not self._cancelled.is_set():
+                _safe_emit(self.signals.error, self.item, _describe_unexpected_error(exc))
         else:
             if not self._cancelled.is_set():
                 _safe_emit(self.signals.finished, self.item, info)
@@ -3354,6 +4171,12 @@ class ChannelRefreshTask(CancellableTaskMixin, QRunnable):
         except (RuntimeError, ValueError, json.JSONDecodeError) as exc:
             if not self._cancelled.is_set():
                 _safe_emit(self.signals.error, str(exc))
+        except PermissionError:
+            if not self._cancelled.is_set():
+                _safe_emit(self.signals.error, "yt-dlp could not be run (permission denied)")
+        except Exception as exc:
+            if not self._cancelled.is_set():
+                _safe_emit(self.signals.error, _describe_unexpected_error(exc))
         else:
             if not self._cancelled.is_set():
                 _safe_emit(self.signals.finished, info)
@@ -3459,6 +4282,7 @@ class ProfileLabel(QLabel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.setTextFormat(Qt.TextFormat.PlainText)  # profile names come from folder names
         self._base_text = self.text()
         self.setCursor(Qt.PointingHandCursor)
         # True while the profile-switch popup this label opened is showing -
@@ -3489,7 +4313,7 @@ class ProfileLabel(QLabel):
         width = self.width()
         elided = self.fontMetrics().elidedText(full, Qt.TextElideMode.ElideRight, width) if width > 0 else full
         super().setText(elided)
-        self.setToolTip(self._base_text if elided != full else "")
+        self.setToolTip(_plain_tooltip(self._base_text) if elided != full else "")
 
     # Called by MainWindow when the profile-switch popup opens/closes. While
     # open, the hint stays regardless of hover/timer state; on close, revert
@@ -3919,6 +4743,15 @@ class MainWindow(QMainWindow):
         # these (see _save_links_to_disk/_flush_links_autosave).
         self._links_dirty = False
         self._sidebar_info_dirty = False
+        # After a failed links save, the autosave tick waits until this monotonic time
+        # before retrying (re-serializing a big tree every second would be wasteful
+        # while the disk is just unwritable); see _flush_links_autosave.
+        self._links_save_retry_after = 0.0
+        self._write_error_dialog_shown = False
+        self._closing = False
+        # Set by _shutdown_background_work if any worker thread was still stuck after
+        # the grace period; main() then exits hard instead of letting teardown hang.
+        self._exit_immediately = False
 
         self._log_header = f"{APP_NAME} v{APP_VERSION} — UI ready"
         self._prev_url_text = ""
@@ -3986,6 +4819,7 @@ class MainWindow(QMainWindow):
         self._load_enabled_plugins_from_disk()
 
         self._build_ui()
+        self._mark_data_labels_plain_text()
 
         # Pool of worker threads that run yt-dlp probes. Fixed at 1: probing more
         # than one link at a time isn't needed, so this isn't user-configurable.
@@ -4074,17 +4908,84 @@ class MainWindow(QMainWindow):
         self._start_ffmpeg_update_check()
         self._start_app_update_check()
 
-    # Flush any links-file save/sidebar-totals refresh that was deferred by a
-    # recent download progress/speed tick (see _set_download_progress/
-    # set_download_speed and _links_autosave_timer) before actually closing -
-    # otherwise up to ~1 second of the most recent progress could be lost from
-    # disk if the window closes right in between two autosave ticks.
+    # Closing the window has to actually wind the app down: stop every download,
+    # probe and refresh (killing their yt-dlp/ffmpeg process trees) and wait briefly
+    # for the worker threads to finish, then flush any links-file save/sidebar refresh
+    # that was deferred by a recent progress tick - otherwise yt-dlp keeps downloading
+    # invisibly after the window is gone, and Qt's thread pools block teardown until
+    # those downloads end on their own. If a background update (yt-dlp/ffmpeg) is
+    # mid-install, ask first, since quitting could leave a half-written binary.
     def closeEvent(self, event):
+        if (self._ytdlp_update_task is not None or self._ffmpeg_update_task is not None) \
+                and not self._confirm_quit_during_update():
+            event.ignore()
+            return
+        failing = current_write_failures()
+        if failing and not self._confirm_quit_with_unsaved_data(failing):
+            event.ignore()
+            return
+        self._closing = True
+        self._shutdown_background_work()
+        # One last attempt regardless of any retry back-off
+        self._links_save_retry_after = 0.0
         self._flush_links_autosave()
         super().closeEvent(event)
 
+    # "Quit anyway?" prompt shown when closing while a save is known to be failing
+    def _confirm_quit_with_unsaved_data(self, failing):
+        details = "\n".join(f"{Path(path).name}: {reason}" for path, reason in failing.items())
+        answer = _show_plain_message(
+            self, QMessageBox.Icon.Question, "Unsaved changes",
+            "Some of your links or settings could not be saved:\n\n"
+            f"{details}\n\nQuitting now will lose those changes. Quit anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
+
+    # "Quit anyway?" prompt shown when the window is closed during a yt-dlp/ffmpeg update
+    def _confirm_quit_during_update(self):
+        answer = QMessageBox.question(
+            self, "Update in progress",
+            "A yt-dlp/ffmpeg update is still running. Quitting now may leave it "
+            "incomplete. Quit anyway?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        return answer == QMessageBox.Yes
+
+    # Stop timers, cancel all downloads/probes/refreshes (same paths as the Stop
+    # buttons), then give the thread pools up to SHUTDOWN_WAIT_MS *in total* to drain.
+    # Anything still running after that is recorded in _exit_immediately so main() can
+    # exit without waiting on it.
+    def _shutdown_background_work(self):
+        for timer in (self._links_autosave_timer, self._scheduler_timer,
+                      self._download_timeout_timer):
+            timer.stop()
+        self._stop_all_downloads()
+        self._stop_all_probing()
+        deadline = time.monotonic() + SHUTDOWN_WAIT_MS / 1000.0
+        for pool in (self._download_pool, self._probe_pool, QThreadPool.globalInstance()):
+            pool.clear()  # drop anything queued but not yet started
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not pool.waitForDone(remaining_ms):
+                self._exit_immediately = True
+
 
     # Assemble the main splitter layout (URL/settings panel, sidebar, log, button row)
+    # Force plain-text rendering on every label whose text includes something the app
+    # doesn't control (see _plain_tooltip): the preview's title/uploader/detail lines
+    # (video titles, folder names), and the version/status lines (version strings read
+    # from a binary's output and from GitHub). Labels holding the app's own HTML links
+    # (the "click to update" ones, the donate/GitHub text) are deliberately left alone.
+    def _mark_data_labels_plain_text(self):
+        for label in (
+            self.title_label, self.subtitle_label, self.detail_label,
+            self.about_app_update_text_label,
+            self.about_ytdlp_version_label, self.about_ytdlp_update_text_label,
+            self.about_ffmpeg_version_label, self.about_ffmpeg_update_text_label,
+            self.settings_update_label,
+        ):
+            label.setTextFormat(Qt.TextFormat.PlainText)
+
     def _build_ui(self):
         self.central = QWidget()
         self.central.setStyleSheet(f"background-color: {BG_WINDOW};")
@@ -4234,6 +5135,8 @@ class MainWindow(QMainWindow):
         self.settings_controls = [
             ("quality", self.quality_combo,
              lambda w: w.currentText(), lambda w, v: w.setCurrentText(v)),
+            ("audio_as_mp3", self.chk_audio_mp3,
+             lambda w: w.isChecked(), lambda w, v: w.setChecked(bool(v))),
             ("location", self.location_edit,
              lambda w: w.text(), lambda w, v: w.setText(v)),
             ("proxy_enabled", self.chk_proxy,
@@ -4388,6 +5291,19 @@ class MainWindow(QMainWindow):
         self.quality_combo.setStyleSheet(settings_input_style())
         self.quality_label = self._settings_label("Quality", 0)
         form.addRow(self.quality_label, self.quality_combo)
+
+        # Off by default. When on, "Audio only" downloads are converted from the native
+        # stream (usually .webm) to .mp3 after downloading (see download_url).
+        self.chk_audio_mp3 = QCheckBox("Audio only as mp3")
+        self.chk_audio_mp3.setChecked(False)
+        self.chk_audio_mp3.setStyleSheet(checkbox_style())
+        self.chk_audio_mp3.setToolTip(
+            "Convert Audio only downloads from the native format (usually .webm) to .mp3"
+        )
+        self._settings_search_index.append({
+            "text": "Audio only as mp3", "tab_index": 0, "widget": self.chk_audio_mp3,
+        })
+        form.addRow(self.chk_audio_mp3)
         self._general_form = form
 
         location_row = QWidget()
@@ -4443,6 +5359,7 @@ class MainWindow(QMainWindow):
             '" - promo text" will be removed from "name - promo text"'
         )
         self.ignore_title_pattern_edit.setStyleSheet(settings_input_style())
+        self.ignore_title_pattern_edit.textChanged.connect(self._on_ignore_title_pattern_changed)
         ignore_pattern_form.addRow(self.ignore_pattern_label, self.ignore_title_pattern_edit)
         layout.addLayout(ignore_pattern_form)
 
@@ -5918,7 +6835,8 @@ class MainWindow(QMainWindow):
         self._update_number_playlist_downloads_visibility()
         self._update_subgroup_channels_visibility()
         self._log(f"Switched to profile '{name}'")
-        QMessageBox.information(self, "Profile switched", f"Switched to profile : {name}")
+        _show_plain_message(self, QMessageBox.Icon.Information, "Profile switched",
+                            f"Switched to profile : {name}")
 
     # Re-scan every profile from disk - a profile folder may have been deleted (or a
     # backup copied back in) from outside the program since it was last loaded - and
@@ -5974,6 +6892,7 @@ class MainWindow(QMainWindow):
     def _update_quality_visibility(self):
         visible = not self._current_profile_is_generic_file()
         self._general_form.setRowVisible(self.quality_combo, visible)
+        self._general_form.setRowVisible(self.chk_audio_mp3, visible)
 
     # "Number playlist downloads" only means anything for a profile whose links can
     # come from a playlist listing (where yt-dlp reports each entry's position in
@@ -6775,13 +7694,20 @@ class MainWindow(QMainWindow):
     # Build a "scheme://host:port" proxy URL from the Connection settings, or None if disabled
     def _current_proxy(self):
         if not self.chk_proxy.isChecked():
+            self._proxy_block_logged_for = None
             return None
         host = self.proxy_host_edit.text().strip()
-        if not host:
-            return None
-        if not self.proxy_host_edit.hasAcceptableInput():
-            self._log(f"Proxy host '{host}' is not a valid IP address, ignoring proxy")
-            return None
+        if not host or not self.proxy_host_edit.hasAcceptableInput():
+            # Proxy is ON but unusable: fail closed (PROXY_BLOCKED) rather than return
+            # None, which would quietly send everything out directly. Logged once per
+            # distinct bad value, since this is called for every probe/download.
+            if getattr(self, "_proxy_block_logged_for", None) != host:
+                self._proxy_block_logged_for = host
+                detail = f"host '{host}' is not a valid IP address" if host else "no proxy host is set"
+                self._log(f"Proxy is turned on but {detail} - blocking connections instead of "
+                          f"going direct. Fix it in Connection settings or turn the proxy off.")
+            return PROXY_BLOCKED
+        self._proxy_block_logged_for = None
         scheme = "socks5" if self.proxy_protocol_combo.currentText() == "SOCKS5" else "http"
         return f"{scheme}://{host}:{self.proxy_port_spin.value()}"
 
@@ -6806,6 +7732,8 @@ class MainWindow(QMainWindow):
         item.setData(0, FORCE_QUALITY_PENDING_ROLE, False)
         self._renumber_url_list()
         self._append_probe_result_to_log(item, info["title"])
+        if info.get("thumbnail_error"):
+            self._log(f"|__ Thumbnail not loaded: {info['thumbnail_error']}")
         self._refresh_preview_if_current(item)
         self._probe_finished()
 
@@ -7296,12 +8224,24 @@ class MainWindow(QMainWindow):
         pattern = self.ignore_title_pattern_edit.text().strip()
         if not pattern:
             return None
-        try:
-            re.compile(pattern)
-        except re.error as exc:
-            self._log(f"Ignore pattern in title is not a valid regex, ignoring it: {exc}")
+        problem = _check_title_pattern(pattern)
+        if problem:
+            self._log(f"Ignore pattern in title rejected ({problem}); ignoring it")
             return None
         return pattern
+
+    # Live validation of the "Ignore pattern in title" field: red border + tooltip with
+    # the reason while the text isn't an acceptable regex (see _check_title_pattern), so
+    # a bad pattern is caught while typing rather than found later as an ignored setting.
+    def _on_ignore_title_pattern_changed(self, text):
+        problem = _check_title_pattern(text.strip())
+        edit = self.ignore_title_pattern_edit
+        if problem:
+            edit.setStyleSheet(settings_input_style() + "QLineEdit { border: 1px solid #d9534f; }")
+            edit.setToolTip(_plain_tooltip(f"This pattern won't be used: {problem}"))
+        else:
+            edit.setStyleSheet(settings_input_style())
+            edit.setToolTip("")
 
     # Log "Downloading: <name>" and reserve an empty line immediately below it -
     # tracked the same way _on_download_line tracks any other item's progress line -
@@ -7344,6 +8284,7 @@ class MainWindow(QMainWindow):
             playlist_index=self._download_number_for_item(item),
             ignore_title_pattern=self._ignore_title_pattern_for_item(item),
             is_file=self._current_profile_is_generic_file(),
+            audio_as_mp3=self.chk_audio_mp3.isChecked(),
         )
         task.signals.progress.connect(self._on_download_progress)
         task.signals.speed.connect(self._on_download_speed)
@@ -7685,9 +8626,9 @@ class MainWindow(QMainWindow):
             finally:
                 QApplication.restoreOverrideCursor()
 
-    # Launch a fully-downloaded link's video file in the system default media
+    # Launch a fully-downloaded link's video/audio file in the system default media
     # player on double-click. No-op for folders, incomplete/never-downloaded
-    # links, or files whose extension isn't a recognized video type.
+    # links, or files whose extension isn't a recognized video or audio type.
     def _on_url_list_item_double_clicked(self, item, column):
         if item.data(0, IS_FOLDER_ROLE):
             return
@@ -7697,7 +8638,7 @@ class MainWindow(QMainWindow):
         if not path_str:
             return
         path = Path(path_str)
-        if path.suffix.lower() not in VIDEO_FILE_EXTENSIONS:
+        if path.suffix.lower() not in VIDEO_FILE_EXTENSIONS | AUDIO_FILE_EXTENSIONS:
             return
         if not path.exists():
             self._log(f"Cannot open, file not found: {path}")
@@ -7725,7 +8666,7 @@ class MainWindow(QMainWindow):
     def _set_elided_text(self, label, text, max_width=260):
         elided = label.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, max_width)
         label.setText(elided)
-        label.setToolTip(text if elided != text else "")
+        label.setToolTip(_plain_tooltip(text) if elided != text else "")
         # Hidden rather than just left blank when there's nothing to show, so an
         # empty title/subtitle/detail line doesn't leave dead space under the
         # thumbnail (same reasoning as duration_label below)
@@ -8664,12 +9605,22 @@ class MainWindow(QMainWindow):
         path_str = item.data(0, DOWNLOAD_PATH_ROLE)
         if not path_str:
             return
-        path = Path(path_str)
+        location = self.location_edit.text().strip()
         try:
-            if path.exists():
-                path.unlink()
-        except OSError as e:
-            self._log(f"Failed to delete file from disk: {path} ({e})")
+            path = Path(path_str)
+            if not path.exists():
+                return
+            # Only ever delete inside the download location - the stored path comes
+            # from links.json (see _is_path_inside_directory)
+            if not _is_path_inside_directory(path, location):
+                self._log(
+                    f"Not deleting {path}: it is outside the download location "
+                    f"({location or 'not set'}). Delete it manually if you want it gone."
+                )
+                return
+            path.unlink()
+        except (OSError, ValueError, TypeError) as e:
+            self._log(f"Failed to delete file from disk: {path_str} ({e})")
 
     # Remove the on-disk directory that backs a folder tree item (location/<folder name>),
     # if it exists. Called after every child link's file has already been deleted.
@@ -8993,6 +9944,11 @@ class MainWindow(QMainWindow):
         old_path = Path(old_path_str)
         if not old_path.is_file():
             return
+        if not _is_path_inside_directory(old_path, location):
+            self._log(
+                f"Not moving {old_path}: it is outside the download location ({location})."
+            )
+            return
         new_dir = Path(self._download_dest_dir_for_folder(new_folder, location))
         new_path = new_dir / old_path.name
         try:
@@ -9152,10 +10108,31 @@ class MainWindow(QMainWindow):
 
     # Save the current URL/folder tree to disk so it can be restored on next launch
     def _save_links_to_disk(self):
-        save_links_file({"items": self._serialize_children(None)})
-        self._links_dirty = False
+        if save_links_file({"items": self._serialize_children(None)}):
+            self._links_dirty = False
+            self._links_save_retry_after = 0.0
+        else:
+            # Stay dirty so the autosave tick keeps retrying; just not every second
+            self._links_dirty = True
+            self._links_save_retry_after = time.monotonic() + LINKS_SAVE_RETRY_SECONDS
         self._sidebar_info_dirty = False
         self._update_sidebar_info()
+
+    # Show anything the file writers have reported since the last tick: every report
+    # goes in the log, and the first failure of the session also gets a (non-modal)
+    # warning, since the log can be minimized and unsaved data is worth interrupting for.
+    def _report_write_problems(self):
+        reports = take_pending_write_reports()
+        for _kind, text in reports:
+            self._log(text)
+        first_error = next((text for kind, text in reports if kind == "error"), None)
+        if first_error and not self._write_error_dialog_shown and not self._closing:
+            self._write_error_dialog_shown = True
+            box = QMessageBox(QMessageBox.Icon.Warning, "Could not save", first_error,
+                              QMessageBox.StandardButton.Ok, self)
+            box.setTextFormat(Qt.TextFormat.PlainText)
+            box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            box.open()
 
     # Once-a-second flush for the two things _set_download_progress/
     # set_download_speed defer instead of doing immediately (see their comments
@@ -9164,8 +10141,10 @@ class MainWindow(QMainWindow):
     # that, a pending sidebar-totals-only refresh for a speed change that arrived
     # without any accompanying progress change.
     def _flush_links_autosave(self):
-        if self._links_dirty:
+        self._report_write_problems()
+        if self._links_dirty and time.monotonic() >= self._links_save_retry_after:
             self._save_links_to_disk()
+            self._report_write_problems()
         elif self._sidebar_info_dirty:
             self._sidebar_info_dirty = False
             self._update_sidebar_info()
@@ -9273,7 +10252,9 @@ class MainWindow(QMainWindow):
             if not url or not _is_valid_url(url):
                 return None
             item.setData(0, URL_ROLE, url)
-            link_uuid = node.get("uuid") or str(uuid.uuid4())
+            link_uuid = node.get("uuid")
+            if not _is_safe_link_uuid(link_uuid):
+                link_uuid = str(uuid.uuid4())
             item.setData(0, LINK_UUID_ROLE, link_uuid)
             existing_thumb = _existing_thumbnail_path(link_uuid)
             if existing_thumb is not None:
@@ -9292,7 +10273,7 @@ class MainWindow(QMainWindow):
             if progress is not None:
                 item.setData(0, DOWNLOAD_PROGRESS_ROLE, progress)
             download_path = node.get("download_path")
-            if download_path:
+            if download_path and isinstance(download_path, str):
                 item.setData(0, DOWNLOAD_PATH_ROLE, download_path)
             playlist_index = node.get("playlist_index")
             if playlist_index is not None:
@@ -9500,9 +10481,31 @@ class MainWindow(QMainWindow):
         else:
             cursor.insertText(header_text)
 
-    # Append a line to the log area
+    # Append a line to the log area, as plain text. QTextEdit.append() would render
+    # anything that looks like HTML (see _plain_tooltip), so this does by hand what it
+    # does - a new paragraph with the widget's current block/char format, scrolling to
+    # the bottom only if the view was already there - but always inserts literal text.
+    # (The anchor flag is dropped from the format: when the first line is the
+    # "update available" link, appended lines would otherwise inherit its anchor.)
     def _log(self, msg):
-        self.log.append(msg)
+        bar = self.log.verticalScrollBar()
+        at_bottom = bar.value() >= bar.maximum()
+        current = self.log.textCursor()
+        char_format = current.charFormat()
+        char_format.setAnchor(False)
+        char_format.setAnchorHref("")
+        cursor = QTextCursor(self.log.document())
+        cursor.beginEditBlock()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        if not self.log.document().isEmpty():
+            cursor.insertBlock(current.blockFormat(), char_format)
+        else:
+            cursor.setBlockFormat(current.blockFormat())
+            cursor.setCharFormat(char_format)
+        cursor.insertText(str(msg))
+        cursor.endEditBlock()
+        if at_bottom:
+            bar.setValue(bar.maximum())
 
     # Like _log, but only actually logs when the "Enable detailed log" setting is
     # on - for messages that are useful context but noisy enough to skip by default
@@ -9885,7 +10888,8 @@ class MainWindow(QMainWindow):
 
         name = chosen.name
         if name in self._enabled_plugins:
-            QMessageBox.information(self, "Already added", f'"{name}" is already in the plugin list.')
+            _show_plain_message(self, QMessageBox.Icon.Information, "Already added",
+                                f'"{name}" is already in the plugin list.')
             return
 
         self._enabled_plugins.append(name)
@@ -9982,14 +10986,34 @@ class MainWindow(QMainWindow):
         if delete_from_disk is None:
             return
         if delete_from_disk:
-            links_data = _load_json_file(_dir_for_profile(name) / LINKS_FILENAME) or {}
-            for path_str in _collect_download_paths_from_nodes(links_data.get("items") or []):
-                path = Path(path_str)
+            # The download location of the profile being deleted (not necessarily the
+            # active one): the live field for the active profile, else its saved setting,
+            # else what a profile without one of its own would start with.
+            if name == self._current_profile_name:
+                location = self.location_edit.text().strip()
+            else:
+                saved = _load_json_file(_dir_for_profile(name) / SETTINGS_FILENAME)
+                location = saved.get("location") if isinstance(saved, dict) else None
+                if not isinstance(location, str) or not location.strip():
+                    location = self._new_profile_settings_baseline().get("location") or ""
+            links_data = _load_json_file(_dir_for_profile(name) / LINKS_FILENAME)
+            if not isinstance(links_data, dict):
+                links_data = {}
+            items = links_data.get("items")
+            for path_str in _collect_download_paths_from_nodes(items if isinstance(items, list) else []):
                 try:
-                    if path.exists():
-                        path.unlink()
-                except OSError as e:
-                    self._log(f"Failed to delete file from disk: {path} ({e})")
+                    path = Path(path_str)
+                    if not path.exists():
+                        continue
+                    if not _is_path_inside_directory(path, location):
+                        self._log(
+                            f"Not deleting {path}: it is outside this profile's download "
+                            f"location ({location or 'not set'}). Delete it manually if you want it gone."
+                        )
+                        continue
+                    path.unlink()
+                except (OSError, ValueError, TypeError) as e:
+                    self._log(f"Failed to delete file from disk: {path_str} ({e})")
         switching_away = name == self._current_profile_name
         self._profiles = [p for p in self._profiles if p["name"] != name]
         if switching_away:
@@ -10032,6 +11056,7 @@ class MainWindow(QMainWindow):
         self.location_edit.setStyleSheet(settings_input_style())
         self.proxy_host_edit.setStyleSheet(settings_input_style())
         self.ignore_title_pattern_edit.setStyleSheet(settings_input_style())
+        self._on_ignore_title_pattern_changed(self.ignore_title_pattern_edit.text())
         for time_edit in (self.scheduler_start_time_edit, self.scheduler_stop_time_edit):
             time_edit.setStyleSheet(settings_input_style())
         for btn in (
@@ -10040,7 +11065,7 @@ class MainWindow(QMainWindow):
             btn.setStyleSheet(button_style())
         for chk in (
             self.chk_proxy, self.chk_detailed_log, self.chk_number_playlist_downloads,
-            self.chk_scheduler_start, self.chk_scheduler_stop,
+            self.chk_scheduler_start, self.chk_scheduler_stop, self.chk_audio_mp3,
         ):
             chk.setStyleSheet(checkbox_style())
         self.profile_list.setStyleSheet(profile_list_style())
@@ -10124,6 +11149,8 @@ def main():
     # anything else to keep it alive, and nothing later in this function should
     # ever reassign or drop it.
     os_lock = _acquire_os_instance_lock()
+    # (os_lock may also be _INSTANCE_LOCK_UNAVAILABLE - see its comment - which is
+    # deliberately not None: start normally, just without single-instance protection.)
     if os_lock is None:
         # Someone else already holds the OS-level lock - just need a bare
         # QApplication to talk to them over the local socket (see
@@ -10207,7 +11234,20 @@ def main():
     # yt-dlp/ffmpeg inside the .exe (see _bundled_bin_dir), so a fresh install has
     # neither yet - see _check_required_binaries_on_startup.
     win._check_required_binaries_on_startup()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    if win._exit_immediately:
+        # Worker threads that didn't stop within the shutdown grace period (see
+        # MainWindow._shutdown_background_work) would make interpreter/Qt teardown wait
+        # on them indefinitely, leaving a windowless process behind. Everything worth
+        # keeping was already flushed to disk in closeEvent, and the OS releases the
+        # instance lock on exit.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+        os._exit(exit_code)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

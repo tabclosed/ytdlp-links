@@ -84,6 +84,12 @@ jobs:
       - name: Build with PyInstaller (onefile)
         run: pyinstaller ytdlp-links.spec
 
+      # Diagnostic: show exactly what the onefile build produced. A single
+      # file (dist/ytdlp-links[.exe]) is expected, NOT a dist/ytdlp-links/ folder.
+      - name: List onefile build output
+        shell: bash
+        run: ls -laR dist
+
       # Windows and Linux (both x86_64 and arm64) also get a second build
       # variant: --onedir instead of --onefile, i.e. the executable plus its
       # dependencies as a folder of loose files rather than one
@@ -138,6 +144,8 @@ jobs:
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.artifact_name }}
+          # Fail here, at the build, instead of later in the release job.
+          if-no-files-found: error
 
       - name: Upload onedir build artifact (Windows only)
         if: runner.os == 'Windows'
@@ -183,6 +191,7 @@ jobs:
       # themselves.
       - name: Collect assets under their release filenames
         run: |
+          ls -laR artifacts
           mkdir release-assets
           cp artifacts/ytdlp-links-windows.exe/ytdlp-links.exe release-assets/ytdlp-links-windows.exe
           cp artifacts/ytdlp-links-linux/ytdlp-links release-assets/ytdlp-links-linux
